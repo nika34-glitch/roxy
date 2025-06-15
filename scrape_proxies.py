@@ -110,6 +110,11 @@ PROXYSCRAPE_SOCKS5_URL = (
 GIMMEPROXY_URL = "https://gimmeproxy.com/api/getProxy"
 PUBPROXY_URL = "http://pubproxy.com/api/proxy"
 PROXYKINGDOM_URL = "https://api.proxykingdom.com/proxy?token=xN9IoZDLnMzUC0"
+GEONODE_URL = (
+    "https://proxylist.geonode.com/api/proxy-list"
+    "?limit=500&page=4&sort_by=lastChecked&sort_type=desc"
+)
+GEONODE_INTERVAL = 5  # seconds between geonode API requests
 
 proxy_set = set()
 lock = threading.Lock()
@@ -339,6 +344,34 @@ def scrape_proxykingdom(interval: float = API_INTERVAL) -> None:
                         write_proxies_to_file()
         except Exception as e:
             print(f"Error fetching proxykingdom: {e}", file=sys.stderr)
+        time.sleep(interval)
+
+
+def scrape_geonode(interval: int = GEONODE_INTERVAL) -> None:
+    """Fetch proxies from the geonode API."""
+    while True:
+        proxies = []
+        try:
+            data = fetch_json(GEONODE_URL)
+            for item in data.get("data", []):
+                ip = item.get("ip")
+                port = item.get("port")
+                protocols = item.get("protocols") or []
+                proto = protocols[0].lower() if protocols else "http"
+                if ip and port:
+                    proxies.append(f"{proto}:{ip}:{port}")
+        except Exception as e:
+            print(f"Error fetching geonode proxies: {e}", file=sys.stderr)
+
+        if proxies:
+            with lock:
+                added = False
+                for p in proxies:
+                    if p not in proxy_set:
+                        proxy_set.add(p)
+                        added = True
+                if added:
+                    write_proxies_to_file()
         time.sleep(interval)
 
 
@@ -588,6 +621,7 @@ def main() -> None:
         threading.Thread(target=scrape_gimmeproxy, daemon=True),
         threading.Thread(target=scrape_pubproxy, daemon=True),
         threading.Thread(target=scrape_proxykingdom, daemon=True),
+        threading.Thread(target=scrape_geonode, daemon=True),
     ]
     for t in threads:
         t.start()

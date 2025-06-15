@@ -8,6 +8,7 @@ import asyncio
 import os
 import socket
 import struct
+from bs4 import BeautifulSoup
 
 MTPROTO_URL = "https://mtpro.xyz/api/?type=mtproto"
 SOCKS_URL = "https://mtpro.xyz/api/?type=socks"
@@ -115,6 +116,15 @@ GEONODE_URL = (
     "?limit=500&page=4&sort_by=lastChecked&sort_type=desc"
 )
 GEONODE_INTERVAL = 5  # seconds between geonode API requests
+
+# Free proxy list websites
+PROXY_LIST_SITES = [
+    ("https://free-proxy-list.net/", "http"),
+    ("https://us-proxy.org/", "http"),
+    ("https://sslproxies.org/", "http"),
+    ("https://socks-proxy.net/", "socks5"),
+]
+PROXY_LIST_INTERVAL = 600  # sites update roughly every 10 minutes
 
 proxy_set = set()
 lock = threading.Lock()
@@ -375,6 +385,45 @@ def scrape_geonode(interval: int = GEONODE_INTERVAL) -> None:
         time.sleep(interval)
 
 
+def scrape_proxy_list_sites(interval: int = PROXY_LIST_INTERVAL) -> None:
+    """Fetch proxies from free-proxy-list.net and similar sites."""
+    while True:
+        for url, proto in PROXY_LIST_SITES:
+            try:
+                resp = requests.get(url, timeout=10)
+                resp.raise_for_status()
+                soup = BeautifulSoup(resp.text, "html.parser")
+                proxies = []
+                textarea = soup.find("textarea")
+                if textarea:
+                    text = textarea.get_text()
+                    for line in text.splitlines():
+                        line = line.strip()
+                        if re.match(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$", line):
+                            proxies.append(f"{proto}:{line}")
+                else:
+                    for row in soup.select("table tbody tr"):
+                        cols = row.find_all("td")
+                        if len(cols) >= 2:
+                            ip = cols[0].get_text(strip=True)
+                            port = cols[1].get_text(strip=True)
+                            if re.match(r"^(?:\d{1,3}\.){3}\d{1,3}$", ip) and port.isdigit():
+                                proxies.append(f"{proto}:{ip}:{port}")
+                if proxies:
+                    with lock:
+                        added = False
+                        for p in proxies:
+                            if p not in proxy_set:
+                                proxy_set.add(p)
+                                added = True
+                        if added:
+                            write_proxies_to_file()
+            except Exception as e:
+                print(f"Error fetching {url}: {e}", file=sys.stderr)
+            time.sleep(random.uniform(1, 3))
+        time.sleep(interval)
+
+
 async def _irc_listener(server: str, port: int = 6667) -> None:
     """Connect to an IRC server and monitor channels for proxy announcements."""
     import string
@@ -622,6 +671,7 @@ def main() -> None:
         threading.Thread(target=scrape_pubproxy, daemon=True),
         threading.Thread(target=scrape_proxykingdom, daemon=True),
         threading.Thread(target=scrape_geonode, daemon=True),
+        threading.Thread(target=scrape_proxy_list_sites, daemon=True),
     ]
     for t in threads:
         t.start()

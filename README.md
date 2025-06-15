@@ -5,6 +5,7 @@ This repository contains a Python script that continuously gathers proxies from 
 ## Requirements
 - Python 3
 - `requests` library (`pip install requests`)
+- `beautifulsoup4` (`pip install beautifulsoup4`)
 
 ## Usage
 Run the scraper:
@@ -13,5 +14,5 @@ Run the scraper:
 python3 scrape_proxies.py
 ```
 
-The script continuously fetches the latest proxies from `https://mtpro.xyz/api/?type=mtproto` and `https://mtpro.xyz/api/?type=socks`, listens on many proxy-sharing IRC channels, queries a collection of free proxy APIs, and checks the configured paste feeds. Newly discovered proxies are deduplicated and written to `proxies.txt`.
-The APIs polled include ProxyScrape, ProxyKingdom, GimmeProxy and PubProxy. Each endpoint is queried approximately every 0.3 seconds.
+The script continuously fetches the latest proxies from `https://mtpro.xyz/api/?type=mtproto` and `https://mtpro.xyz/api/?type=socks`, listens on many proxy-sharing IRC channels, queries a collection of free proxy APIs, scrapes several public proxy listing websites, and checks the configured paste feeds. Newly discovered proxies are deduplicated and written to `proxies.txt`.
+The APIs polled include ProxyScrape, ProxyKingdom, GimmeProxy and PubProxy. Proxy lists are also fetched from `free-proxy-list.net`, `us-proxy.org`, `sslproxies.org` and `socks-proxy.net` approximately every 10 minutes.

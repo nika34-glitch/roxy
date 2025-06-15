@@ -115,6 +115,7 @@ GEONODE_URL = (
     "?limit=500&page=4&sort_by=lastChecked&sort_type=desc"
 )
 GEONODE_INTERVAL = 5  # seconds between geonode API requests
+PROXY_LIST_URL = "https://www.proxy-list.download/api/v1/get"
 
 proxy_set = set()
 lock = threading.Lock()
@@ -375,6 +376,36 @@ def scrape_geonode(interval: int = GEONODE_INTERVAL) -> None:
         time.sleep(interval)
 
 
+def scrape_proxy_list_api(interval: float = API_INTERVAL) -> None:
+    """Fetch proxies from proxy-list.download."""
+    protocols = ["http", "https", "socks4", "socks5"]
+    while True:
+        proxies = []
+        for proto in protocols:
+            url = f"{PROXY_LIST_URL}?type={proto}"
+            try:
+                resp = requests.get(url, timeout=10)
+                resp.raise_for_status()
+                for line in resp.text.splitlines():
+                    line = line.strip()
+                    if line:
+                        proxies.append(f"{proto}:{line}")
+            except Exception as e:
+                print(f"Error fetching {url}: {e}", file=sys.stderr)
+            time.sleep(interval)
+
+        if proxies:
+            with lock:
+                added = False
+                for p in proxies:
+                    if p not in proxy_set:
+                        proxy_set.add(p)
+                        added = True
+                if added:
+                    write_proxies_to_file()
+        time.sleep(interval)
+
+
 async def _irc_listener(server: str, port: int = 6667) -> None:
     """Connect to an IRC server and monitor channels for proxy announcements."""
     import string
@@ -622,6 +653,7 @@ def main() -> None:
         threading.Thread(target=scrape_pubproxy, daemon=True),
         threading.Thread(target=scrape_proxykingdom, daemon=True),
         threading.Thread(target=scrape_geonode, daemon=True),
+        threading.Thread(target=scrape_proxy_list_api, daemon=True),
     ]
     for t in threads:
         t.start()

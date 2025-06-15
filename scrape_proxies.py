@@ -137,6 +137,13 @@ FREEPROXY_SOCKS5_URL = (
 )
 FREEPROXY_INTERVAL = 120  # fetch every 2 minutes
 
+# Fresh Proxy List (vakhov.github.io)
+FRESHPROXY_HTTP_URL = "https://vakhov.github.io/fresh-proxy-list/http.txt"
+FRESHPROXY_HTTPS_URL = "https://vakhov.github.io/fresh-proxy-list/https.txt"
+FRESHPROXY_SOCKS4_URL = "https://vakhov.github.io/fresh-proxy-list/socks4.txt"
+FRESHPROXY_SOCKS5_URL = "https://vakhov.github.io/fresh-proxy-list/socks5.txt"
+FRESHPROXY_INTERVAL = 300  # fetch every 5 minutes
+
 # Free proxy list websites
 PROXY_LIST_SITES = [
     ("https://free-proxy-list.net/", "http"),
@@ -538,6 +545,39 @@ def scrape_freeproxy(interval: int = FREEPROXY_INTERVAL) -> None:
         time.sleep(interval)
 
 
+def scrape_freshproxy(interval: int = FRESHPROXY_INTERVAL) -> None:
+    """Fetch proxies from the Fresh Proxy List project."""
+    urls = [
+        (FRESHPROXY_HTTP_URL, "http"),
+        (FRESHPROXY_HTTPS_URL, "https"),
+        (FRESHPROXY_SOCKS4_URL, "socks4"),
+        (FRESHPROXY_SOCKS5_URL, "socks5"),
+    ]
+    while True:
+        proxies = []
+        for url, proto in urls:
+            try:
+                resp = requests.get(url, timeout=10)
+                resp.raise_for_status()
+                for line in resp.text.splitlines():
+                    line = line.strip()
+                    if line and re.match(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$", line):
+                        proxies.append(f"{proto}:{line}")
+            except Exception as e:
+                print(f"Error fetching {url}: {e}", file=sys.stderr)
+            time.sleep(1)
+        if proxies:
+            with lock:
+                added = False
+                for p in proxies:
+                    if p not in proxy_set:
+                        proxy_set.add(p)
+                        added = True
+                if added:
+                    write_proxies_to_file()
+        time.sleep(interval)
+
+
 async def _irc_listener(server: str, port: int = 6667) -> None:
     """Connect to an IRC server and monitor channels for proxy announcements."""
     import string
@@ -789,6 +829,7 @@ def main() -> None:
         threading.Thread(target=scrape_proxy_list_sites, daemon=True),
         threading.Thread(target=scrape_proxy_list_download, daemon=True),
         threading.Thread(target=scrape_freeproxy, daemon=True),
+        threading.Thread(target=scrape_freshproxy, daemon=True),
     ]
     for t in threads:
         t.start()

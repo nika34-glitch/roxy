@@ -16,3 +16,4 @@ python3 scrape_proxies.py
 
 The script continuously fetches the latest proxies from `https://mtpro.xyz/api/?type=mtproto` and `https://mtpro.xyz/api/?type=socks`, listens on many proxy-sharing IRC channels, queries a collection of free proxy APIs, scrapes several public proxy listing websites, and checks the configured paste feeds. Newly discovered proxies are deduplicated and written to `proxies.txt`.
 The APIs polled include ProxyScrape, ProxyKingdom, GimmeProxy, PubProxy and ProxySpace. Proxy lists are also fetched from `free-proxy-list.net`, `us-proxy.org`, `sslproxies.org` and `socks-proxy.net` approximately every 10 minutes. ProxySpace endpoints are queried every 20 minutes.
+The scraper additionally polls the HTTP, SOCKS4 and SOCKS5 lists from the `Free-Proxy` GitHub project every two minutes.

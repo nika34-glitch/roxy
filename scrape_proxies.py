@@ -125,6 +125,18 @@ PROXYSPACE_SOCKS5_URL = "https://proxyspace.pro/socks5.txt"
 # fetch new lists roughly every 20 minutes
 PROXYSPACE_INTERVAL = 1200
 
+# dpangestuw Free-Proxy GitHub lists
+FREEPROXY_HTTP_URL = (
+    "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/http_proxies.txt"
+)
+FREEPROXY_SOCKS4_URL = (
+    "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/socks4_proxies.txt"
+)
+FREEPROXY_SOCKS5_URL = (
+    "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/socks5_proxies.txt"
+)
+FREEPROXY_INTERVAL = 120  # fetch every 2 minutes
+
 # Free proxy list websites
 PROXY_LIST_SITES = [
     ("https://free-proxy-list.net/", "http"),
@@ -494,6 +506,38 @@ def scrape_proxy_list_download(interval: float = API_INTERVAL) -> None:
         time.sleep(interval)
 
 
+def scrape_freeproxy(interval: int = FREEPROXY_INTERVAL) -> None:
+    """Fetch proxies from dpangestuw Free-Proxy GitHub lists."""
+    urls = [
+        (FREEPROXY_HTTP_URL, "http"),
+        (FREEPROXY_SOCKS4_URL, "socks4"),
+        (FREEPROXY_SOCKS5_URL, "socks5"),
+    ]
+    while True:
+        proxies = []
+        for url, proto in urls:
+            try:
+                resp = requests.get(url, timeout=10)
+                resp.raise_for_status()
+                for line in resp.text.splitlines():
+                    line = line.strip()
+                    if line:
+                        proxies.append(f"{proto}:{line}")
+            except Exception as e:
+                print(f"Error fetching {url}: {e}", file=sys.stderr)
+            time.sleep(1)
+        if proxies:
+            with lock:
+                added = False
+                for p in proxies:
+                    if p not in proxy_set:
+                        proxy_set.add(p)
+                        added = True
+                if added:
+                    write_proxies_to_file()
+        time.sleep(interval)
+
+
 async def _irc_listener(server: str, port: int = 6667) -> None:
     """Connect to an IRC server and monitor channels for proxy announcements."""
     import string
@@ -744,6 +788,7 @@ def main() -> None:
         threading.Thread(target=scrape_proxyspace, daemon=True),
         threading.Thread(target=scrape_proxy_list_sites, daemon=True),
         threading.Thread(target=scrape_proxy_list_download, daemon=True),
+        threading.Thread(target=scrape_freeproxy, daemon=True),
     ]
     for t in threads:
         t.start()

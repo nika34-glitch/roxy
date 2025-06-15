@@ -1,6 +1,6 @@
 # Proxy Scraper
 
-This repository contains a Python script that continuously gathers proxies from multiple sources. It scrapes MTProto and SOCKS5 proxies from [mtpro.xyz](https://mtpro.xyz) and also monitors several pastebin-like feeds for `IP:PORT` entries. New proxies are written to `proxies.txt` and may be prefixed with `http:` or `socks5:` when the protocol is detected.
+This repository contains a Python script that continuously gathers proxies from multiple sources. It scrapes MTProto and SOCKS5 proxies from [mtpro.xyz](https://mtpro.xyz), monitors several pastebin-like feeds for `IP:PORT` entries, and periodically collects public Tor relay addresses from the [Onionoo](https://onionoo.torproject.org) service. New proxies are written to `proxies.txt` and may be prefixed with `http:` or `socks5:` when the protocol is detected.
 
 ## Requirements
 - Python 3

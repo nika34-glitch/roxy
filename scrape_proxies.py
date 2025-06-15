@@ -38,6 +38,10 @@ MAX_DHT_CONCURRENCY = 50
 PROXY_PORTS = {8080, 3128, 1080, 9050, 8000, 8081, 8888}
 DHT_LOG_EVERY = 100  # log progress every N visited nodes
 
+# Tor relay crawling configuration
+ONIONOO_URL = "https://onionoo.torproject.org/details"
+TOR_INTERVAL = 3600  # seconds between Tor relay list updates
+
 proxy_set = set()
 lock = threading.Lock()
 
@@ -135,6 +139,39 @@ def monitor_paste_feeds(interval: int = PASTE_INTERVAL) -> None:
                     if added:
                         write_proxies_to_file()
             time.sleep(random.uniform(*FEED_DELAY_RANGE))
+        time.sleep(interval)
+
+
+def scrape_tor_relays(interval: int = TOR_INTERVAL) -> None:
+    """Fetch relay descriptors from Onionoo and record their addresses."""
+    while True:
+        try:
+            data = fetch_json(ONIONOO_URL)
+        except Exception as e:
+            print(f"Error fetching Tor relays: {e}", file=sys.stderr)
+            time.sleep(interval)
+            continue
+
+        proxies = []
+        for relay in data.get("relays", []):
+            for addr in relay.get("or_addresses", []):
+                host_port = addr.split("?")[0]
+                if ":" not in host_port:
+                    continue
+                host, port = host_port.rsplit(":", 1)
+                if port.isdigit():
+                    proxies.append(f"{host}:{port}")
+
+        if proxies:
+            with lock:
+                added = False
+                for p in proxies:
+                    if p not in proxy_set:
+                        proxy_set.add(p)
+                        added = True
+                if added:
+                    write_proxies_to_file()
+
         time.sleep(interval)
 
 
@@ -320,6 +357,7 @@ def main() -> None:
         threading.Thread(target=scrape_mt_proxies, daemon=True),
         threading.Thread(target=monitor_paste_feeds, daemon=True),
         threading.Thread(target=lambda: asyncio.run(crawl_dht()), daemon=True),
+        threading.Thread(target=scrape_tor_relays, daemon=True),
     ]
     for t in threads:
         t.start()

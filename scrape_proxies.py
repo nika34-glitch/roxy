@@ -29,6 +29,60 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
 ]
 
+# IRC collection configuration
+IRC_SERVERS = [
+    "irc.undernet.org",
+    "irc.rizon.net",
+    "irc.libera.chat",
+    "irc.abjects.net",
+    "irc.efnet.org",
+    "irc.darkscience.net",
+    "irc.dal.net",
+]
+
+IRC_CHANNELS = [
+    "#proxy",
+    "#proxylist",
+    "#proxies",
+    "#proxyleaks",
+    "#socks",
+    "#socks4",
+    "#socks5",
+    "#leech",
+    "#leechers",
+    "#0day",
+    "#darkweb",
+    "#darkproxies",
+    "#http",
+    "#socks_proxy",
+    "#proxyfeeds",
+    "#botnet",
+    "#scraperbots",
+    "#anonproxies",
+    "#blackhat",
+    "#hackers",
+    "#freeland",
+    "#datadump",
+    "#dump",
+    "#proxy-dump",
+    "#proxy_bots",
+    "#proxy_scrape",
+    "#dumpville",
+    "#proxy_zone",
+    "#openproxies",
+    "#publicproxies",
+    "#proxyhunt",
+    "#torleaks",
+    "#rawfeeds",
+    "#autoproxy",
+    "#scanfeeds",
+    "#mirrors",
+    "#ipfeeds",
+    "#portscanners",
+    "#hostlist",
+    "#proxylogs",
+]
+
 # DHT crawling configuration
 BOOTSTRAP_NODES = [
     ("router.bittorrent.com", 6881),
@@ -173,6 +227,64 @@ def scrape_tor_relays(interval: int = TOR_INTERVAL) -> None:
                     write_proxies_to_file()
 
         time.sleep(interval)
+
+
+async def _irc_listener(server: str, port: int = 6667) -> None:
+    """Connect to an IRC server and monitor channels for proxy announcements."""
+    import string
+
+    while True:
+        reader = writer = None
+        try:
+            reader, writer = await asyncio.open_connection(server, port)
+            nick = "bot" + "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+            writer.write(f"NICK {nick}\r\n".encode())
+            writer.write(f"USER {nick} 0 * :{nick}\r\n".encode())
+            await writer.drain()
+
+            await asyncio.sleep(5)
+            channels = IRC_CHANNELS[:]
+            random.shuffle(channels)
+            for chan in channels:
+                writer.write(f"JOIN {chan}\r\n".encode())
+                await writer.drain()
+                await asyncio.sleep(random.uniform(1, 3))
+
+            while True:
+                line = await reader.readline()
+                if not line:
+                    raise ConnectionError("EOF")
+                text = line.decode(errors="ignore").strip()
+                if text.startswith("PING"):
+                    token = text.split()[1]
+                    writer.write(f"PONG {token}\r\n".encode())
+                    await writer.drain()
+                    continue
+                proxies = extract_proxies(text)
+                if proxies:
+                    with lock:
+                        added = False
+                        for p in proxies:
+                            if p not in proxy_set:
+                                proxy_set.add(p)
+                                added = True
+                        if added:
+                            write_proxies_to_file()
+        except Exception as e:
+            print(f"IRC {server} error: {e}", file=sys.stderr)
+        finally:
+            if writer:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+        await asyncio.sleep(10)
+
+
+async def monitor_irc_channels() -> None:
+    tasks = [asyncio.create_task(_irc_listener(s)) for s in IRC_SERVERS]
+    await asyncio.gather(*tasks)
 
 
 def bencode(value) -> bytes:
@@ -358,6 +470,7 @@ def main() -> None:
         threading.Thread(target=monitor_paste_feeds, daemon=True),
         threading.Thread(target=lambda: asyncio.run(crawl_dht()), daemon=True),
         threading.Thread(target=scrape_tor_relays, daemon=True),
+        threading.Thread(target=lambda: asyncio.run(monitor_irc_channels()), daemon=True),
     ]
     for t in threads:
         t.start()

@@ -96,6 +96,21 @@ DHT_LOG_EVERY = 100  # log progress every N visited nodes
 ONIONOO_URL = "https://onionoo.torproject.org/details"
 TOR_INTERVAL = 3600  # seconds between Tor relay list updates
 
+# Additional HTTP API backends
+API_INTERVAL = 0.3  # delay between individual API requests
+PROXYSCRAPE_HTTP_URL = (
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all&ssl=no&anonymity=all"
+)
+PROXYSCRAPE_SOCKS4_URL = (
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4&timeout=10000&country=all"
+)
+PROXYSCRAPE_SOCKS5_URL = (
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000&country=all"
+)
+GIMMEPROXY_URL = "https://gimmeproxy.com/api/getProxy"
+PUBPROXY_URL = "http://pubproxy.com/api/proxy"
+PROXYKINGDOM_URL = "https://api.proxykingdom.com/proxy?token=xN9IoZDLnMzUC0"
+
 proxy_set = set()
 lock = threading.Lock()
 
@@ -226,6 +241,104 @@ def scrape_tor_relays(interval: int = TOR_INTERVAL) -> None:
                 if added:
                     write_proxies_to_file()
 
+        time.sleep(interval)
+
+
+def scrape_proxyscrape(interval: float = API_INTERVAL) -> None:
+    urls = [
+        (PROXYSCRAPE_HTTP_URL, "http"),
+        (PROXYSCRAPE_SOCKS4_URL, "socks4"),
+        (PROXYSCRAPE_SOCKS5_URL, "socks5"),
+    ]
+    while True:
+        proxies = []
+        for url, proto in urls:
+            try:
+                resp = requests.get(url, timeout=10)
+                resp.raise_for_status()
+                for line in resp.text.splitlines():
+                    line = line.strip()
+                    if line:
+                        proxies.append(f"{proto}:{line}")
+            except Exception as e:
+                print(f"Error fetching {url}: {e}", file=sys.stderr)
+            time.sleep(interval)
+        if proxies:
+            with lock:
+                added = False
+                for p in proxies:
+                    if p not in proxy_set:
+                        proxy_set.add(p)
+                        added = True
+                if added:
+                    write_proxies_to_file()
+        time.sleep(interval)
+
+
+def scrape_gimmeproxy(interval: float = API_INTERVAL) -> None:
+    while True:
+        try:
+            resp = requests.get(GIMMEPROXY_URL, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            ip = data.get("ip")
+            port = data.get("port")
+            protocol = data.get("protocol")
+            if ip and port and protocol:
+                entry = f"{protocol.lower()}:{ip}:{port}"
+                with lock:
+                    if entry not in proxy_set:
+                        proxy_set.add(entry)
+                        write_proxies_to_file()
+        except Exception as e:
+            print(f"Error fetching gimmeproxy: {e}", file=sys.stderr)
+        time.sleep(interval)
+
+
+def scrape_pubproxy(interval: float = API_INTERVAL) -> None:
+    while True:
+        try:
+            resp = requests.get(PUBPROXY_URL, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            items = data.get("data", [])
+            if items:
+                item = items[0]
+                ip_port = item.get("ipPort")
+                if ip_port and ":" in ip_port:
+                    ip, port = ip_port.split(":", 1)
+                else:
+                    ip = item.get("ip")
+                    port = item.get("port")
+                protocol = item.get("type", "http")
+                if ip and port:
+                    entry = f"{protocol.lower()}:{ip}:{port}"
+                    with lock:
+                        if entry not in proxy_set:
+                            proxy_set.add(entry)
+                            write_proxies_to_file()
+        except Exception as e:
+            print(f"Error fetching pubproxy: {e}", file=sys.stderr)
+        time.sleep(interval)
+
+
+def scrape_proxykingdom(interval: float = API_INTERVAL) -> None:
+    while True:
+        try:
+            resp = requests.get(PROXYKINGDOM_URL, timeout=10)
+            resp.raise_for_status()
+            data = resp.json()
+            ip = data.get("address") or data.get("ip")
+            port = data.get("port")
+            protocol = data.get("protocol")
+            if ip and port and protocol:
+                entry = f"{protocol.lower()}:{ip}:{port}"
+                with lock:
+                    if entry not in proxy_set:
+                        proxy_set.add(entry)
+                        write_proxies_to_file()
+        except Exception as e:
+            print(f"Error fetching proxykingdom: {e}", file=sys.stderr)
         time.sleep(interval)
 
 
@@ -471,6 +584,10 @@ def main() -> None:
         threading.Thread(target=lambda: asyncio.run(crawl_dht()), daemon=True),
         threading.Thread(target=scrape_tor_relays, daemon=True),
         threading.Thread(target=lambda: asyncio.run(monitor_irc_channels()), daemon=True),
+        threading.Thread(target=scrape_proxyscrape, daemon=True),
+        threading.Thread(target=scrape_gimmeproxy, daemon=True),
+        threading.Thread(target=scrape_pubproxy, daemon=True),
+        threading.Thread(target=scrape_proxykingdom, daemon=True),
     ]
     for t in threads:
         t.start()

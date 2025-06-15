@@ -4,6 +4,10 @@ import sys
 import threading
 import random
 import re
+import asyncio
+import os
+import socket
+import struct
 
 MTPROTO_URL = "https://mtpro.xyz/api/?type=mtproto"
 SOCKS_URL = "https://mtpro.xyz/api/?type=socks"
@@ -24,6 +28,15 @@ USER_AGENTS = [
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
 ]
+
+# DHT crawling configuration
+BOOTSTRAP_NODES = [
+    ("router.bittorrent.com", 6881),
+    ("dht.transmissionbt.com", 6881),
+]
+MAX_DHT_CONCURRENCY = 50
+PROXY_PORTS = {8080, 3128, 1080, 9050, 8000, 8081, 8888}
+DHT_LOG_EVERY = 100  # log progress every N visited nodes
 
 proxy_set = set()
 lock = threading.Lock()
@@ -125,10 +138,188 @@ def monitor_paste_feeds(interval: int = PASTE_INTERVAL) -> None:
         time.sleep(interval)
 
 
+def bencode(value) -> bytes:
+    if isinstance(value, int):
+        return b"i" + str(value).encode() + b"e"
+    if isinstance(value, bytes):
+        return str(len(value)).encode() + b":" + value
+    if isinstance(value, str):
+        b = value.encode()
+        return str(len(b)).encode() + b":" + b
+    if isinstance(value, list):
+        return b"l" + b"".join(bencode(v) for v in value) + b"e"
+    if isinstance(value, dict):
+        items = sorted(value.items())
+        return b"d" + b"".join(bencode(k) + bencode(v) for k, v in items) + b"e"
+    raise TypeError("Unsupported type for bencoding")
+
+
+def bdecode(data: bytes):
+    def parse(index: int):
+        lead = data[index:index + 1]
+        if lead == b"i":
+            end = data.index(b"e", index + 1)
+            return int(data[index + 1:end]), end + 1
+        if lead == b"l":
+            index += 1
+            lst = []
+            while data[index:index + 1] != b"e":
+                item, index = parse(index)
+                lst.append(item)
+            return lst, index + 1
+        if lead == b"d":
+            index += 1
+            d = {}
+            while data[index:index + 1] != b"e":
+                key, index = parse(index)
+                val, index = parse(index)
+                d[key] = val
+            return d, index + 1
+        if lead.isdigit():
+            colon = data.index(b":", index)
+            length = int(data[index:colon])
+            start = colon + 1
+            end = start + length
+            return data[start:end], end
+        raise ValueError("Invalid bencode")
+
+    value, _ = parse(0)
+    return value
+
+
+class DHTClient(asyncio.DatagramProtocol):
+    def __init__(self, node_id: bytes):
+        self.node_id = node_id
+        self.transactions: dict[bytes, asyncio.Future] = {}
+        self.transport: asyncio.DatagramTransport | None = None
+
+    def connection_made(self, transport: asyncio.BaseTransport) -> None:
+        self.transport = transport  # type: ignore
+
+    def datagram_received(self, data: bytes, addr) -> None:
+        try:
+            msg = bdecode(data)
+        except Exception:
+            return
+        tid = msg.get(b"t")
+        fut = self.transactions.pop(tid, None)
+        if fut and not fut.done():
+            fut.set_result((msg, addr))
+
+    async def _query(self, addr: tuple[str, int], msg: dict) -> tuple[dict, tuple[str, int]]:
+        tid = os.urandom(2)
+        msg[b"t"] = tid
+        data = bencode(msg)
+        fut = asyncio.get_running_loop().create_future()
+        self.transactions[tid] = fut
+        assert self.transport is not None
+        self.transport.sendto(data, addr)
+        try:
+            return await asyncio.wait_for(fut, timeout=5)
+        finally:
+            self.transactions.pop(tid, None)
+
+    async def find_node(self, addr: tuple[str, int], target: bytes):
+        msg = {b"y": b"q", b"q": b"find_node", b"a": {b"id": self.node_id, b"target": target}}
+        return await self._query(addr, msg)
+
+    async def get_peers(self, addr: tuple[str, int], info_hash: bytes):
+        msg = {b"y": b"q", b"q": b"get_peers", b"a": {b"id": self.node_id, b"info_hash": info_hash}}
+        return await self._query(addr, msg)
+
+
+def _decode_nodes(data: bytes) -> list[tuple[str, int]]:
+    nodes = []
+    for i in range(0, len(data), 26):
+        segment = data[i:i + 26]
+        if len(segment) < 26:
+            continue
+        ip = socket.inet_ntoa(segment[20:24])
+        port = struct.unpack("!H", segment[24:26])[0]
+        nodes.append((ip, port))
+    return nodes
+
+
+def _decode_peers(values: list) -> list[tuple[str, int]]:
+    peers = []
+    for val in values:
+        if len(val) != 6:
+            continue
+        ip = socket.inet_ntoa(val[:4])
+        port = struct.unpack("!H", val[4:6])[0]
+        peers.append((ip, port))
+    return peers
+
+
+async def crawl_dht() -> None:
+    loop = asyncio.get_running_loop()
+    node_id = os.urandom(20)
+    transport, client = await loop.create_datagram_endpoint(
+        lambda: DHTClient(node_id), local_addr=("0.0.0.0", 0)
+    )
+
+    queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
+    visited: set[tuple[str, int]] = set()
+
+    for host, port in BOOTSTRAP_NODES:
+        try:
+            ip = socket.gethostbyname(host)
+            queue.put_nowait((ip, port))
+        except Exception as e:
+            print(f"Failed to resolve {host}: {e}")
+
+    sem = asyncio.Semaphore(MAX_DHT_CONCURRENCY)
+    count = 0
+
+    async def worker() -> None:
+        nonlocal count
+        while True:
+            ip, port = await queue.get()
+            if (ip, port) in visited:
+                queue.task_done()
+                continue
+            visited.add((ip, port))
+            async with sem:
+                try:
+                    resp, _ = await client.find_node((ip, port), os.urandom(20))
+                    nodes = _decode_nodes(resp.get(b"r", {}).get(b"nodes", b""))
+                    for n in nodes:
+                        if n not in visited:
+                            queue.put_nowait(n)
+                except Exception:
+                    pass
+                try:
+                    resp, _ = await client.get_peers((ip, port), os.urandom(20))
+                    vals = resp.get(b"r", {}).get(b"values", [])
+                    peers = _decode_peers(vals)
+                    if peers:
+                        with lock:
+                            added = False
+                            for p_ip, p_port in peers:
+                                if p_port in PROXY_PORTS:
+                                    entry = f"{p_ip}:{p_port}"
+                                    if entry not in proxy_set:
+                                        proxy_set.add(entry)
+                                        added = True
+                            if added:
+                                write_proxies_to_file()
+                except Exception:
+                    pass
+
+                count += 1
+                if count % DHT_LOG_EVERY == 0:
+                    print(f"DHT: visited {len(visited)} nodes, proxies {len(proxy_set)}")
+            queue.task_done()
+
+    workers = [asyncio.create_task(worker()) for _ in range(MAX_DHT_CONCURRENCY)]
+    await asyncio.gather(*workers)
+
+
 def main() -> None:
     threads = [
         threading.Thread(target=scrape_mt_proxies, daemon=True),
         threading.Thread(target=monitor_paste_feeds, daemon=True),
+        threading.Thread(target=lambda: asyncio.run(crawl_dht()), daemon=True),
     ]
     for t in threads:
         t.start()

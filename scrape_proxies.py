@@ -117,6 +117,14 @@ GEONODE_URL = (
 )
 GEONODE_INTERVAL = 5  # seconds between geonode API requests
 
+# ProxySpace backend configuration
+PROXYSPACE_HTTP_URL = "https://proxyspace.pro/http.txt"
+PROXYSPACE_HTTPS_URL = "https://proxyspace.pro/https.txt"
+PROXYSPACE_SOCKS4_URL = "https://proxyspace.pro/socks4.txt"
+PROXYSPACE_SOCKS5_URL = "https://proxyspace.pro/socks5.txt"
+# fetch new lists roughly every 20 minutes
+PROXYSPACE_INTERVAL = 1200
+
 # Free proxy list websites
 PROXY_LIST_SITES = [
     ("https://free-proxy-list.net/", "http"),
@@ -373,6 +381,39 @@ def scrape_geonode(interval: int = GEONODE_INTERVAL) -> None:
         except Exception as e:
             print(f"Error fetching geonode proxies: {e}", file=sys.stderr)
 
+        if proxies:
+            with lock:
+                added = False
+                for p in proxies:
+                    if p not in proxy_set:
+                        proxy_set.add(p)
+                        added = True
+                if added:
+                    write_proxies_to_file()
+        time.sleep(interval)
+
+
+def scrape_proxyspace(interval: int = PROXYSPACE_INTERVAL) -> None:
+    """Fetch proxies from proxyspace.pro lists."""
+    urls = [
+        (PROXYSPACE_HTTP_URL, "http"),
+        (PROXYSPACE_HTTPS_URL, "https"),
+        (PROXYSPACE_SOCKS4_URL, "socks4"),
+        (PROXYSPACE_SOCKS5_URL, "socks5"),
+    ]
+    while True:
+        proxies = []
+        for url, proto in urls:
+            try:
+                resp = requests.get(url, timeout=10)
+                resp.raise_for_status()
+                for line in resp.text.splitlines():
+                    line = line.strip()
+                    if line:
+                        proxies.append(f"{proto}:{line}")
+            except Exception as e:
+                print(f"Error fetching {url}: {e}", file=sys.stderr)
+            time.sleep(1)
         if proxies:
             with lock:
                 added = False
@@ -700,6 +741,7 @@ def main() -> None:
         threading.Thread(target=scrape_pubproxy, daemon=True),
         threading.Thread(target=scrape_proxykingdom, daemon=True),
         threading.Thread(target=scrape_geonode, daemon=True),
+        threading.Thread(target=scrape_proxyspace, daemon=True),
         threading.Thread(target=scrape_proxy_list_sites, daemon=True),
         threading.Thread(target=scrape_proxy_list_download, daemon=True),
     ]

@@ -175,6 +175,11 @@ PROXY_LIST_SITES = [
 ]
 PROXY_LIST_INTERVAL = 600  # sites update roughly every 10 minutes
 
+# spys.me proxy lists
+SPYS_HTTP_URL = "https://spys.me/proxy.txt"
+SPYS_SOCKS_URL = "https://spys.me/socks.txt"
+SPYS_INTERVAL = 300  # fetch every 5 minutes
+
 proxy_set = set()
 lock = threading.Lock()
 
@@ -741,6 +746,54 @@ def scrape_kangproxy(interval: int = KANGPROXY_INTERVAL) -> None:
         time.sleep(interval)
 
 
+def _parse_spys_list(text: str) -> list[tuple[str, str]]:
+    """Return list of (ip, port) from spys.me proxy list text."""
+    proxies = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line.startswith("Proxy list") or line.startswith("Http proxy") \
+                or line.startswith("Socks proxy") or line.startswith("Support") \
+                or line.startswith("BTC") or line.startswith("IP address") \
+                or line.lower().startswith("free "):
+            continue
+        ip_port = line.split()[0]
+        if re.match(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$", ip_port):
+            ip, port = ip_port.split(":", 1)
+            proxies.append((ip, port))
+    return proxies
+
+
+def scrape_spys(interval: int = SPYS_INTERVAL) -> None:
+    """Fetch proxies from spys.me lists and store as type;ip;port."""
+    urls = [
+        (SPYS_HTTP_URL, "http"),
+        (SPYS_SOCKS_URL, "socks5"),
+    ]
+    while True:
+        proxies = []
+        for url, proto in urls:
+            try:
+                resp = requests.get(url, timeout=10)
+                resp.raise_for_status()
+                for ip, port in _parse_spys_list(resp.text):
+                    proxies.append(f"{proto};{ip};{port}")
+            except Exception as e:
+                print(f"Error fetching {url}: {e}", file=sys.stderr)
+            time.sleep(1)
+
+        if proxies:
+            with lock:
+                added = False
+                for p in proxies:
+                    if p not in proxy_set:
+                        proxy_set.add(p)
+                        added = True
+                if added:
+                    write_proxies_to_file()
+
+        time.sleep(interval)
+
+
 async def _irc_listener(server: str, port: int = 6667) -> None:
     """Connect to an IRC server and monitor channels for proxy announcements."""
     import string
@@ -997,6 +1050,7 @@ def main() -> None:
         threading.Thread(target=scrape_freeproxy_world, daemon=True),
         threading.Thread(target=scrape_freeproxy_all, daemon=True),
         threading.Thread(target=scrape_kangproxy, daemon=True),
+        threading.Thread(target=scrape_spys, daemon=True),
     ]
     for t in threads:
         t.start()

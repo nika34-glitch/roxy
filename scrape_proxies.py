@@ -181,6 +181,10 @@ SPYS_HTTP_URL = "https://spys.me/proxy.txt"
 SPYS_SOCKS_URL = "https://spys.me/socks.txt"
 SPYS_INTERVAL = 300  # fetch every 5 minutes
 
+# ProxyBros free proxy list
+PROXYBROS_URL = "https://proxybros.com/free-proxy-list/"
+PROXYBROS_INTERVAL = 600  # fetch every 10 minutes
+
 proxy_set = set()
 lock = threading.Lock()
 
@@ -862,6 +866,39 @@ def scrape_spys(interval: int = SPYS_INTERVAL) -> None:
         time.sleep(interval)
 
 
+def scrape_proxybros(interval: int = PROXYBROS_INTERVAL) -> None:
+    """Fetch proxies from proxybros.com free proxy list."""
+    while True:
+        proxies = []
+        try:
+            headers = {"User-Agent": random.choice(USER_AGENTS)}
+            resp = requests.get(PROXYBROS_URL, headers=headers, timeout=10)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            for row in soup.select("table.proxylist-table tbody tr"):
+                ip_el = row.select_one("span.proxy-ip[data-ip]")
+                port_el = row.select_one("td[data-port]")
+                cells = row.find_all("td")
+                if ip_el and port_el and len(cells) >= 5:
+                    ip = ip_el.get_text(strip=True)
+                    port = port_el.get_text(strip=True)
+                    proto = cells[4].get_text(strip=True).lower()
+                    proxies.append(f"{proto}:{ip}:{port}")
+        except Exception as e:
+            print(f"Error fetching proxybros proxies: {e}", file=sys.stderr)
+
+        if proxies:
+            with lock:
+                added = False
+                for p in proxies:
+                    if p not in proxy_set:
+                        proxy_set.add(p)
+                        added = True
+                if added:
+                    write_proxies_to_file()
+        time.sleep(interval)
+
+
 async def _irc_listener(server: str, port: int = 6667) -> None:
     """Connect to an IRC server and monitor channels for proxy announcements."""
     import string
@@ -1120,6 +1157,7 @@ def main() -> None:
         threading.Thread(target=scrape_freeproxy_all, daemon=True),
         threading.Thread(target=scrape_kangproxy, daemon=True),
         threading.Thread(target=scrape_spys, daemon=True),
+        threading.Thread(target=scrape_proxybros, daemon=True),
     ]
     for t in threads:
         t.start()

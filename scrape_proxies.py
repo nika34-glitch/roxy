@@ -136,6 +136,11 @@ FREEPROXY_SOCKS5_URL = (
     "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/socks5_proxies.txt"
 )
 FREEPROXY_INTERVAL = 120  # fetch every 2 minutes
+# aggregated list updated every 5 minutes
+FREEPROXY_ALL_URL = (
+    "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/All_proxies.txt"
+)
+FREEPROXY_ALL_INTERVAL = 300
 
 # Fresh Proxy List (vakhov.github.io)
 FRESHPROXY_HTTP_URL = "https://vakhov.github.io/fresh-proxy-list/http.txt"
@@ -143,6 +148,11 @@ FRESHPROXY_HTTPS_URL = "https://vakhov.github.io/fresh-proxy-list/https.txt"
 FRESHPROXY_SOCKS4_URL = "https://vakhov.github.io/fresh-proxy-list/socks4.txt"
 FRESHPROXY_SOCKS5_URL = "https://vakhov.github.io/fresh-proxy-list/socks5.txt"
 FRESHPROXY_INTERVAL = 300  # fetch every 5 minutes
+
+# KangProxy aggregated lists
+KANGPROXY_OLD_URL = "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/xResults/old-data/RAW.txt"
+KANGPROXY_URL = "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/xResults/RAW.txt"
+KANGPROXY_INTERVAL = 14400  # fetch every 4 hours
 
 # Proxifly GitHub proxy lists
 PROXIFLY_HTTP_URL = (
@@ -624,6 +634,71 @@ def scrape_proxifly(interval: int = PROXIFLY_INTERVAL) -> None:
         time.sleep(interval)
 
 
+def scrape_freeproxy_all(interval: int = FREEPROXY_ALL_INTERVAL) -> None:
+    """Fetch aggregated proxies from dpangestuw Free-Proxy."""
+    while True:
+        proxies = []
+        try:
+            resp = requests.get(FREEPROXY_ALL_URL, timeout=10)
+            resp.raise_for_status()
+            for line in resp.text.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                if '://' in line:
+                    proto, rest = line.split('://', 1)
+                    proxies.append(f"{proto.lower()}:{rest}")
+                elif re.match(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$", line):
+                    proxies.append(f"http:{line}")
+        except Exception as e:
+            print(f"Error fetching {FREEPROXY_ALL_URL}: {e}", file=sys.stderr)
+
+        if proxies:
+            with lock:
+                added = False
+                for p in proxies:
+                    if p not in proxy_set:
+                        proxy_set.add(p)
+                        added = True
+                if added:
+                    write_proxies_to_file()
+        time.sleep(interval)
+
+
+def scrape_kangproxy(interval: int = KANGPROXY_INTERVAL) -> None:
+    """Fetch proxies from the KangProxy raw lists."""
+    urls = [KANGPROXY_OLD_URL, KANGPROXY_URL]
+    while True:
+        proxies = []
+        for url in urls:
+            try:
+                resp = requests.get(url, timeout=10)
+                resp.raise_for_status()
+                for line in resp.text.splitlines():
+                    line = line.strip()
+                    if not line:
+                        continue
+                    if '://' in line:
+                        proto, rest = line.split('://', 1)
+                        proxies.append(f"{proto.lower()}:{rest}")
+                    elif re.match(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$", line):
+                        proxies.append(f"http:{line}")
+            except Exception as e:
+                print(f"Error fetching {url}: {e}", file=sys.stderr)
+            time.sleep(1)
+
+        if proxies:
+            with lock:
+                added = False
+                for p in proxies:
+                    if p not in proxy_set:
+                        proxy_set.add(p)
+                        added = True
+                if added:
+                    write_proxies_to_file()
+        time.sleep(interval)
+
+
 async def _irc_listener(server: str, port: int = 6667) -> None:
     """Connect to an IRC server and monitor channels for proxy announcements."""
     import string
@@ -877,6 +952,8 @@ def main() -> None:
         threading.Thread(target=scrape_freeproxy, daemon=True),
         threading.Thread(target=scrape_freshproxy, daemon=True),
         threading.Thread(target=scrape_proxifly, daemon=True),
+        threading.Thread(target=scrape_freeproxy_all, daemon=True),
+        threading.Thread(target=scrape_kangproxy, daemon=True),
     ]
     for t in threads:
         t.start()

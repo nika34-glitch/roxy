@@ -6,6 +6,7 @@ import re
 import base64
 import asyncio
 import uvloop
+
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 from functools import lru_cache
 import os
@@ -15,7 +16,7 @@ import json
 import ssl
 import importlib.util
 from pathlib import Path
-from typing import AsyncGenerator, List
+from typing import AsyncGenerator, List, Any
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
 import gzip
@@ -31,6 +32,7 @@ import csv
 import bisect
 from collections import defaultdict
 from pybloom_live import ScalableBloomFilter
+
 try:
     from score_cython import score_single_proxy as cy_score_single_proxy
 except Exception:
@@ -300,14 +302,16 @@ httpx_client = None
 USE_HTTP2 = os.getenv("USE_HTTP2", "0") == "1"
 MAIN_LOOP: asyncio.AbstractEventLoop | None = None
 
-proxy_set: ScalableBloomFilter = ScalableBloomFilter(mode=ScalableBloomFilter.SMALL_SET_GROWTH)
+proxy_set: ScalableBloomFilter = ScalableBloomFilter(
+    mode=ScalableBloomFilter.SMALL_SET_GROWTH
+)
 DNS_RESOLVER = aiodns.DNSResolver()
 SOURCE_BACKOFF: defaultdict[str, int] = defaultdict(int)
 proxy_lock = asyncio.Lock()
 new_entries: asyncio.Queue[str] = asyncio.Queue()
 write_event = asyncio.Event()
 lock = threading.Lock()
-_open_files: dict[str, aiofiles.BaseFile] = {}
+_open_files: dict[str, Any] = {}
 DNS_CACHE: dict[str, tuple[str, float]] = {}
 DNS_CACHE_TTL = 60.0
 
@@ -343,8 +347,33 @@ GEO_DATA: list[tuple[int, int, str]] = []
 _geo_loaded = False
 ALLOWED_COUNTRIES = {"IT"}
 EU_COUNTRIES = {
-    "AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU",
-    "IE","IT","LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE"
+    "AT",
+    "BE",
+    "BG",
+    "HR",
+    "CY",
+    "CZ",
+    "DK",
+    "EE",
+    "FI",
+    "FR",
+    "DE",
+    "GR",
+    "HU",
+    "IE",
+    "IT",
+    "LV",
+    "LT",
+    "LU",
+    "MT",
+    "NL",
+    "PL",
+    "PT",
+    "RO",
+    "SK",
+    "SI",
+    "ES",
+    "SE",
 }
 
 ERR_STATS: defaultdict[str, dict] = defaultdict(
@@ -455,9 +484,7 @@ async def load_ja3_sets() -> None:
         return
 
     async with aiofiles.open(path, "r") as f:
-        KNOWN_BAD_JA3 = {
-            line.strip() async for line in f if line.strip()
-        }
+        KNOWN_BAD_JA3 = {line.strip() async for line in f if line.strip()}
 
 
 async def load_asn_metadata() -> None:
@@ -681,7 +708,9 @@ async def get_ja3(proxy: str) -> str | None:
             writer.close()
             await writer.wait_closed()
             # Python's default handshake JA3
-            ja3 = "771,49195-49199-49196-49172-57-56-61-60-53-47,0-11-10-35-23-13,23-24,0"
+            ja3 = (
+                "771,49195-49199-49196-49172-57-56-61-60-53-47,0-11-10-35-23-13,23-24,0"
+            )
         except Exception:
             ja3 = None
 
@@ -716,7 +745,6 @@ def update_ip_history(ip: str, success: bool) -> tuple[int, int]:
         fails += 1
     HISTORY[ip] = (first, fails)
     return age_hours, fails
-
 
 
 @lru_cache(maxsize=100000)
@@ -898,7 +926,7 @@ async def _filter_chunk(proxies: list[str]) -> list[str]:
             except Exception:
                 if attempt >= MAX_RETRIES:
                     break
-                await asyncio.sleep(2 ** attempt)
+                await asyncio.sleep(2**attempt)
                 continue
 
             start = time.perf_counter()
@@ -925,7 +953,7 @@ async def _filter_chunk(proxies: list[str]) -> list[str]:
             except Exception:
                 if attempt >= MAX_RETRIES:
                     break
-                await asyncio.sleep(2 ** attempt)
+                await asyncio.sleep(2**attempt)
         record_attempt(ip, success)
         return p if success else None
 
@@ -1000,6 +1028,8 @@ async def quick_validate(proxies: list[str]) -> list[str]:
 
 def _output_path(proto: str) -> str:
     base = f"{proto}_" + os.path.basename(OUTPUT_FILE)
+    if OUTPUT_DIR and not os.path.isdir(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
     return os.path.join(OUTPUT_DIR, base)
 
 
@@ -1133,7 +1163,9 @@ def filter_p1(proxy_url: str, service_name: str) -> bool:
     return result
 
 
-async def _score_single_proxy(p: str, ctx: ssl.SSLContext) -> tuple[str, int, dict[str, int]] | None:
+async def _score_single_proxy(
+    p: str, ctx: ssl.SSLContext
+) -> tuple[str, int, dict[str, int]] | None:
     if cy_score_single_proxy is not None:
         return cy_score_single_proxy(p)
     norm = normalize_proxy(p)
@@ -1296,7 +1328,6 @@ async def filter_p2(proxies: list[str]) -> list[tuple[str, int]]:
     return results
 
 
-
 async def get_aiohttp_session() -> aiohttp.ClientSession:
     global aiohttp_session, httpx_client
     if USE_HTTP2:
@@ -1398,7 +1429,10 @@ async def fetch_proxxy_sources() -> AsyncGenerator[List[str], None]:
         urls.extend(url_list)
 
     session = await get_aiohttp_session()
-    tasks = {asyncio.create_task(session.get(url, timeout=REQUEST_TIMEOUT)): url for url in urls}
+    tasks = {
+        asyncio.create_task(session.get(url, timeout=REQUEST_TIMEOUT)): url
+        for url in urls
+    }
     batch: List[str] = []
     for task in asyncio.as_completed(tasks):
         url = tasks[task]
@@ -1545,13 +1579,22 @@ async def fetch_with_backoff(url: str, max_retries: int = 5) -> str:
                 and not isinstance(session, aiohttp.ClientSession)
             ):
                 resp = await session.get(url, headers=headers)
-                if resp.status == 429:
-                    SOURCE_BACKOFF[url] = min(SOURCE_BACKOFF[url] + 1, 3)
-                else:
-                    SOURCE_BACKOFF[url] = max(SOURCE_BACKOFF[url] - 1, 0)
-                resp.raise_for_status()
-                return resp.text
-            async with session.get(url, headers=headers, timeout=REQUEST_TIMEOUT) as resp:
+                status = getattr(resp, "status", None)
+                if status is None:
+                    status = resp.status_code
+                try:
+                    if status == 429:
+                        SOURCE_BACKOFF[url] = min(SOURCE_BACKOFF[url] + 1, 3)
+                    else:
+                        SOURCE_BACKOFF[url] = max(SOURCE_BACKOFF[url] - 1, 0)
+                    resp.raise_for_status()
+                    text = resp.text
+                finally:
+                    await resp.aclose()
+                return text
+            async with session.get(
+                url, headers=headers, timeout=REQUEST_TIMEOUT
+            ) as resp:
                 if resp.status == 429:
                     SOURCE_BACKOFF[url] = min(SOURCE_BACKOFF[url] + 1, 3)
                 else:
@@ -1656,7 +1699,9 @@ async def scrape_proxyscraper_sources(interval: int = PS_INTERVAL) -> None:
         new_entries: list[str] = []
         for i in range(0, len(urls), batch):
             subset = urls[i : i + batch]
-            texts = await asyncio.gather(*[loop.run_in_executor(None, _ps_get, u) for u in subset])
+            texts = await asyncio.gather(
+                *[loop.run_in_executor(None, _ps_get, u) for u in subset]
+            )
             for url, text in zip(subset, texts):
                 proto_match = PROTO_PARAM_RE.search(url)
                 proto = proto_match.group(1).lower() if proto_match else "http"
@@ -1671,7 +1716,9 @@ async def scrape_proxyscraper_sources(interval: int = PS_INTERVAL) -> None:
         await asyncio.sleep(interval)
 
 
-async def download_proxy_list(urls: list[tuple[str, str]], concurrency: int = 5) -> list[str]:
+async def download_proxy_list(
+    urls: list[tuple[str, str]], concurrency: int = 5
+) -> list[str]:
     """Download simple text proxy lists concurrently."""
     session = await get_aiohttp_session()
     sem = asyncio.Semaphore(concurrency)
@@ -1681,7 +1728,9 @@ async def download_proxy_list(urls: list[tuple[str, str]], concurrency: int = 5)
             try:
                 async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
                     if resp.status >= 400:
-                        raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info, resp.history, status=resp.status
+                        )
                     text = await resp.text()
                 result: list[str] = []
                 for line in text.splitlines():
@@ -1840,7 +1889,9 @@ async def scrape_proxy_list_download() -> None:
             try:
                 async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
                     if resp.status >= 400:
-                        raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info, resp.history, status=resp.status
+                        )
                     text = await resp.text()
                 for line in text.splitlines():
                     line = line.strip()
@@ -1912,7 +1963,9 @@ async def scrape_freeproxy_all() -> None:
         try:
             async with session.get(FREEPROXY_ALL_URL, timeout=REQUEST_TIMEOUT) as resp:
                 if resp.status >= 400:
-                    raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info, resp.history, status=resp.status
+                    )
                 text = await resp.text()
             for line in text.splitlines():
                 line = line.strip()
@@ -1942,7 +1995,9 @@ async def scrape_kangproxy() -> None:
             try:
                 async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
                     if resp.status >= 400:
-                        raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info, resp.history, status=resp.status
+                        )
                     text = await resp.text()
                 for line in text.splitlines():
                     line = line.strip()
@@ -1999,7 +2054,9 @@ async def scrape_spys() -> None:
             try:
                 async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
                     if resp.status >= 400:
-                        raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info, resp.history, status=resp.status
+                        )
                     text = await resp.text()
                 for ip, port in _parse_spys_list(text):
                     proxies.append(f"{proto}:{ip}:{port}")
@@ -2021,9 +2078,13 @@ async def scrape_proxybros() -> None:
         proxies = []
         try:
             headers = {"User-Agent": random.choice(USER_AGENTS)}
-            async with session.get(PROXYBROS_URL, headers=headers, timeout=REQUEST_TIMEOUT) as resp:
+            async with session.get(
+                PROXYBROS_URL, headers=headers, timeout=REQUEST_TIMEOUT
+            ) as resp:
                 if resp.status >= 400:
-                    raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info, resp.history, status=resp.status
+                    )
                 text = await resp.text()
 
             def _parse() -> list[str]:
@@ -2507,18 +2568,36 @@ async def main() -> None:
         tg.create_task(run_periodic(monitor_paste_feeds, SCRAPERS["paste"], "paste"))
         tg.create_task(run_periodic(scrape_tor_relays, SCRAPERS["tor"], "tor"))
         tg.create_task(monitor_irc_channels())
-        tg.create_task(run_periodic(scrape_proxyscrape, SCRAPERS["proxyscrape"], "proxyscrape"))
-        tg.create_task(run_periodic(scrape_gimmeproxy, SCRAPERS["gimmeproxy"], "gimmeproxy"))
+        tg.create_task(
+            run_periodic(scrape_proxyscrape, SCRAPERS["proxyscrape"], "proxyscrape")
+        )
+        tg.create_task(
+            run_periodic(scrape_gimmeproxy, SCRAPERS["gimmeproxy"], "gimmeproxy")
+        )
         tg.create_task(run_periodic(scrape_pubproxy, SCRAPERS["pubproxy"], "pubproxy"))
-        tg.create_task(run_periodic(scrape_proxykingdom, SCRAPERS["proxykingdom"], "proxykingdom"))
+        tg.create_task(
+            run_periodic(scrape_proxykingdom, SCRAPERS["proxykingdom"], "proxykingdom")
+        )
         tg.create_task(run_periodic(scrape_geonode, SCRAPERS["geonode"], "geonode"))
-        tg.create_task(run_periodic(scrape_proxyspace, SCRAPERS["proxyspace"], "proxyspace"))
-        tg.create_task(run_periodic(scrape_proxy_list_sites, SCRAPERS["proxy_list_sites"], "proxy_list_sites"))
+        tg.create_task(
+            run_periodic(scrape_proxyspace, SCRAPERS["proxyspace"], "proxyspace")
+        )
+        tg.create_task(
+            run_periodic(
+                scrape_proxy_list_sites,
+                SCRAPERS["proxy_list_sites"],
+                "proxy_list_sites",
+            )
+        )
         tg.create_task(writer_loop())
         tg.create_task(run_proxxy())
         tg.create_task(scrape_proxyhub(PROXYHUB_INTERVAL, PROXYHUB_CONCURRENCY))
-        tg.create_task(scrape_gatherproxy(GATHER_PROXY_INTERVAL, GATHER_PROXY_CONCURRENCY))
-        tg.create_task(scrape_openproxylist(OPENPROXYLIST_INTERVAL, OPENPROXYLIST_CONCURRENCY))
+        tg.create_task(
+            scrape_gatherproxy(GATHER_PROXY_INTERVAL, GATHER_PROXY_CONCURRENCY)
+        )
+        tg.create_task(
+            scrape_openproxylist(OPENPROXYLIST_INTERVAL, OPENPROXYLIST_CONCURRENCY)
+        )
         tg.create_task(scrape_proxyscraper_sources())
         tg.create_task(scrape_proxy_list_download())
         tg.create_task(scrape_freeproxy())
@@ -2531,6 +2610,7 @@ async def main() -> None:
         tg.create_task(scrape_bloody_proxies())
     for p in procs:
         p.terminate()
+
 
 if __name__ == "__main__":
     import sys

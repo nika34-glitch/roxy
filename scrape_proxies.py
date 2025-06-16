@@ -4,6 +4,7 @@ import sys
 import threading
 import random
 import re
+import base64
 import asyncio
 import os
 import socket
@@ -258,6 +259,73 @@ def scrape_freeproxy_world(interval: int = 20) -> None:
                     break
         except Exception as e:
             print(f"Error fetching freeproxy.world: {e}", file=sys.stderr)
+
+        if proxies:
+            with lock:
+                added = False
+                for p in proxies:
+                    if p not in proxy_set:
+                        proxy_set.add(p)
+                        added = True
+                if added:
+                    write_proxies_to_file()
+
+        time.sleep(interval)
+
+
+def _parse_free_proxy_cz_page(soup: BeautifulSoup) -> list[str]:
+    """Extract proxies from a free-proxy.cz page soup."""
+    proxies: list[str] = []
+    for row in soup.select("tbody tr"):
+        script = row.find("script")
+        if not script or not script.string:
+            continue
+        m = re.search(r'Base64.decode\("([^"]+)"\)', script.string)
+        if not m:
+            continue
+        try:
+            ip = base64.b64decode(m.group(1)).decode()
+        except Exception:
+            continue
+        port_span = row.find("span", class_="fport")
+        if not port_span:
+            continue
+        port = port_span.get_text(strip=True)
+        proto_elem = row.find("small")
+        proto = proto_elem.get_text(strip=True).lower() if proto_elem else "http"
+        proxies.append(f"{proto}:{ip}:{port}")
+    return proxies
+
+
+def scrape_free_proxy_cz(interval: int = 20) -> None:
+    """Fetch proxies from http://free-proxy.cz/en/ across all pages."""
+    base_url = "http://free-proxy.cz"
+    while True:
+        headers = {"User-Agent": random.choice(USER_AGENTS)}
+        proxies: list[str] = []
+        pages = 1
+        try:
+            resp = requests.get(f"{base_url}/en/", headers=headers, timeout=10)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            proxies.extend(_parse_free_proxy_cz_page(soup))
+            links = soup.select('a[href^="/en/proxylist/main/"]')
+            for a in links:
+                m = re.search(r"/en/proxylist/main/(\d+)", a.get("href", ""))
+                if m:
+                    pages = max(pages, int(m.group(1)))
+            for page in range(2, pages + 1):
+                try:
+                    url = f"{base_url}/en/proxylist/main/{page}"
+                    resp = requests.get(url, headers=headers, timeout=10)
+                    resp.raise_for_status()
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    proxies.extend(_parse_free_proxy_cz_page(soup))
+                except Exception as e:
+                    print(f"Error fetching free-proxy.cz page {page}: {e}", file=sys.stderr)
+                    break
+        except Exception as e:
+            print(f"Error fetching free-proxy.cz: {e}", file=sys.stderr)
 
         if proxies:
             with lock:
@@ -1047,6 +1115,7 @@ def main() -> None:
         threading.Thread(target=scrape_freeproxy, daemon=True),
         threading.Thread(target=scrape_freshproxy, daemon=True),
         threading.Thread(target=scrape_proxifly, daemon=True),
+        threading.Thread(target=scrape_free_proxy_cz, daemon=True),
         threading.Thread(target=scrape_freeproxy_world, daemon=True),
         threading.Thread(target=scrape_freeproxy_all, daemon=True),
         threading.Thread(target=scrape_kangproxy, daemon=True),

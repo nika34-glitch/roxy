@@ -10,6 +10,8 @@ import os
 import socket
 import struct
 import json
+import importlib.util
+from pathlib import Path
 from typing import AsyncGenerator, List
 
 from proxyhub import SOURCE_LIST, fetch_source
@@ -26,6 +28,7 @@ PROXXY_SOURCES_FILE = os.path.join(os.path.dirname(__file__), "vendor", "proXXy"
 # ProxyHub async scraping configuration
 PROXYHUB_INTERVAL = 300.0  # seconds between ProxyHub runs
 PROXYHUB_CONCURRENCY = 20  # max concurrent fetches
+BLOODY_INTERVAL = 300  # seconds between Bloody-Proxy-Scraper runs
 
 MT_INTERVAL = 1  # seconds between mtpro.xyz polls
 PASTE_INTERVAL = 60  # seconds between paste feed checks
@@ -218,6 +221,7 @@ SCRAPERS = {
     "kangproxy": KANGPROXY_INTERVAL,
     "spys": SPYS_INTERVAL,
     "proxybros": PROXYBROS_INTERVAL,
+    "bloody": BLOODY_INTERVAL,
     "proxxy": 300,
 }
 
@@ -989,6 +993,48 @@ def scrape_proxybros() -> None:
         time.sleep(interval)
 
 
+def scrape_bloody_proxies() -> None:
+    """Run Bloody-Proxy-Scraper and merge results."""
+    interval = SCRAPERS["bloody"]
+    module_path = (
+        Path(__file__).resolve().parent
+        / "vendor"
+        / "Bloody-Proxy-Scraper"
+        / "data"
+        / "proxyscraper.py"
+    )
+    spec = importlib.util.spec_from_file_location(
+        "bloody_proxyscraper", module_path
+    )
+    loader = spec.loader if spec else None
+    if not spec or loader is None:
+        print("Unable to load Bloody-Proxy-Scraper module", file=sys.stderr)
+        return
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    Scraper = module.ProxyScraper
+
+    while True:
+        proxies: list[str] = []
+        try:
+            scraper = Scraper()
+            result = scraper.scrape_all_proxies()
+            proxies = result.get("all", [[], False])[0]
+        except Exception as e:
+            print(f"Error running Bloody-Proxy-Scraper: {e}", file=sys.stderr)
+
+        if proxies:
+            with lock:
+                added = False
+                for p in proxies:
+                    if p not in proxy_set:
+                        proxy_set.add(p)
+                        added = True
+                if added:
+                    write_proxies_to_file()
+        time.sleep(interval)
+
+
 async def _irc_listener(server: str, port: int = 6667) -> None:
     """Connect to an IRC server and monitor channels for proxy announcements."""
     import string
@@ -1295,6 +1341,7 @@ def main() -> None:
         threading.Thread(target=scrape_kangproxy, daemon=True),
         threading.Thread(target=scrape_spys, daemon=True),
         threading.Thread(target=scrape_proxybros, daemon=True),
+        threading.Thread(target=scrape_bloody_proxies, daemon=True, name="scrape_bloody_proxies"),
         threading.Thread(target=lambda: asyncio.run(run_proxxy()), daemon=True),
         threading.Thread(
             target=lambda: asyncio.run(

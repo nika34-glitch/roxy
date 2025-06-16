@@ -3,13 +3,16 @@ import time
 import sys
 import threading
 import random
-import re
+import regex as re
 import base64
 import asyncio
 import os
 import socket
 import struct
 import json
+import gzip
+import orjson
+import aiofiles
 import importlib.util
 from pathlib import Path
 from typing import AsyncGenerator, List
@@ -22,18 +25,21 @@ from bs4 import BeautifulSoup
 
 MTPROTO_URL = "https://mtpro.xyz/api/?type=mtproto"
 SOCKS_URL = "https://mtpro.xyz/api/?type=socks"
-OUTPUT_FILE = "proxies.txt"
+OUTPUT_COMPRESSED = os.getenv("OUTPUT_COMPRESSED", "0") == "1"
+OUTPUT_FILE = os.getenv("OUTPUT_FILE", "proxies.txt.gz" if OUTPUT_COMPRESSED else "proxies.txt")
 
 PROXXY_SOURCES_FILE = os.path.join(os.path.dirname(__file__), "vendor", "proXXy", "proxy_sources.json")
 
 # ProxyHub async scraping configuration
-PROXYHUB_INTERVAL = 300.0  # seconds between ProxyHub runs
-PROXYHUB_CONCURRENCY = 20  # max concurrent fetches
+PROXYHUB_INTERVAL = float(os.getenv("PROXYHUB_INTERVAL", "300"))  # seconds between ProxyHub runs
+PROXYHUB_CONCURRENCY = int(os.getenv("PROXYHUB_CONCURRENCY", "20"))  # max concurrent fetches
 BLOODY_INTERVAL = 300  # seconds between Bloody-Proxy-Scraper runs
 
 MT_INTERVAL = 1  # seconds between mtpro.xyz polls
 PASTE_INTERVAL = 60  # seconds between paste feed checks
 FEED_DELAY_RANGE = (5, 10)  # delay between individual feed requests
+
+PROXY_RE = re.compile(r"((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})")
 
 PASTE_FEEDS = [
     "https://pastebin.com/feed",
@@ -106,9 +112,10 @@ BOOTSTRAP_NODES = [
     ("router.bittorrent.com", 6881),
     ("dht.transmissionbt.com", 6881),
 ]
-MAX_DHT_CONCURRENCY = 50
+MAX_DHT_CONCURRENCY = int(os.getenv("MAX_DHT_CONCURRENCY", "50"))
 PROXY_PORTS = {8080, 3128, 1080, 9050, 8000, 8081, 8888}
 DHT_LOG_EVERY = 100  # log progress every N visited nodes
+DHT_BATCH_SIZE = int(os.getenv("DHT_BATCH_SIZE", "50"))
 
 # Tor relay crawling configuration
 ONIONOO_URL = "https://onionoo.torproject.org/details"
@@ -148,9 +155,10 @@ PS_SCRAPER_SOURCES = [
     # add any other ProxyScraper endpoints here
 ]
 # seconds between each ProxyScraper fetch cycle
-PS_INTERVAL = 30
+PS_INTERVAL = int(os.getenv("PS_INTERVAL", "30"))
 # how many sources to fetch in parallel
-PS_CONCURRENT_REQUESTS = 5
+PS_CONCURRENT_REQUESTS = int(os.getenv("PS_CONCURRENT_REQUESTS", "5"))
+EXECUTOR = ThreadPoolExecutor(max_workers=PS_CONCURRENT_REQUESTS)
 # Increase PS_CONCURRENT_REQUESTS or lower PS_INTERVAL to speed up scraping,
 # or decrease them to reduce load.
 
@@ -267,6 +275,13 @@ new_entries: list[str] = []
 write_event = asyncio.Event()
 lock = threading.Lock()
 
+def _write_entries_sync(entries: list[str]) -> None:
+    mode = "at" if OUTPUT_COMPRESSED else "a"
+    open_func = gzip.open if OUTPUT_COMPRESSED else open
+    with open_func(OUTPUT_FILE, mode) as f:
+        for p in entries:
+            f.write(p + "\n")
+
 
 async def get_aiohttp_session() -> aiohttp.ClientSession:
     global aiohttp_session
@@ -307,17 +322,17 @@ async def writer_loop() -> None:
         async with proxy_lock:
             if not new_entries:
                 continue
-            with open(OUTPUT_FILE, "a") as f:
-                for p in new_entries:
-                    f.write(p + "\n")
+            entries = list(new_entries)
             new_entries.clear()
+        await asyncio.to_thread(_write_entries_sync, entries)
 
 
 async def fetch_json(url: str) -> dict:
     session = await get_aiohttp_session()
     async with session.get(url, timeout=10) as resp:
         resp.raise_for_status()
-        return await resp.json()
+        data = await resp.read()
+    return orjson.loads(data)
 
 
 async def fetch_proxxy_sources() -> AsyncGenerator[List[str], None]:
@@ -491,9 +506,14 @@ async def fetch_with_backoff(url: str, max_retries: int = 5) -> str:
     return ""
 
 
+async def download_proxy_list(url: str, proto: str) -> list[str]:
+    text = await fetch_with_backoff(url)
+    return [f"{proto}:{line.strip()}" for line in text.splitlines() if line.strip()]
+
+
 def extract_proxies(text: str) -> list[str]:
     found = []
-    for m in re.finditer(r"((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})", text):
+    for m in PROXY_RE.finditer(text):
         ip = m.group(1)
         port = int(m.group(2))
         if not (1 <= port <= 65535):
@@ -578,8 +598,7 @@ def scrape_proxyscraper_sources(interval: int = PS_INTERVAL) -> None:
         new_entries: list[str] = []
         for i in range(0, len(urls), batch):
             subset = urls[i : i + batch]
-            with ThreadPoolExecutor(max_workers=len(subset)) as ex:
-                texts = list(ex.map(_ps_get, subset))
+            texts = list(EXECUTOR.map(_ps_get, subset))
             for url, text in zip(subset, texts):
                 proto_match = re.search(r"protocol=([^&]+)", url)
                 proto = proto_match.group(1).lower() if proto_match else "http"
@@ -599,7 +618,7 @@ async def scrape_gimmeproxy() -> None:
         text = await fetch_with_backoff(GIMMEPROXY_URL)
         if not text:
             return
-        data = json.loads(text)
+        data = orjson.loads(text.encode())
         ip = data.get("ip")
         port = data.get("port")
         protocol = data.get("protocol")
@@ -614,7 +633,7 @@ async def scrape_pubproxy() -> None:
         text = await fetch_with_backoff(PUBPROXY_URL)
         if not text:
             return
-        data = json.loads(text)
+        data = orjson.loads(text.encode())
         items = data.get("data", [])
         if items:
             item = items[0]
@@ -636,7 +655,7 @@ async def scrape_proxykingdom() -> None:
         text = await fetch_with_backoff(PROXYKINGDOM_URL)
         if not text:
             return
-        data = json.loads(text)
+        data = orjson.loads(text.encode())
         ip = data.get("address") or data.get("ip")
         port = data.get("port")
         protocol = data.get("protocol")
@@ -676,11 +695,8 @@ async def scrape_proxyspace() -> None:
     proxies = []
     for url, proto in urls:
         try:
-            text = await fetch_with_backoff(url)
-            for line in text.splitlines():
-                line = line.strip()
-                if line:
-                    proxies.append(f"{proto}:{line}")
+            entries = await download_proxy_list(url, proto)
+            proxies.extend(entries)
         except Exception as e:
             print(f"Error fetching {url}: {e}", file=sys.stderr)
         await asyncio.sleep(1)
@@ -1152,11 +1168,14 @@ async def crawl_dht() -> None:
 
     queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
     visited: set[tuple[str, int]] = set()
+    dht_buffer: list[str] = []
 
     for host, port in BOOTSTRAP_NODES:
         try:
-            ip = socket.gethostbyname(host)
-            queue.put_nowait((ip, port))
+            infos = await loop.getaddrinfo(host, port, family=socket.AF_INET, type=socket.SOCK_DGRAM)
+            if infos:
+                ip = infos[0][4][0]
+                queue.put_nowait((ip, port))
         except Exception as e:
             print(f"Failed to resolve {host}: {e}")
 
@@ -1186,17 +1205,26 @@ async def crawl_dht() -> None:
                     peers = _decode_peers(vals)
                     if peers:
                         entries = [f"{p_ip}:{p_port}" for p_ip, p_port in peers if p_port in PROXY_PORTS]
-                        add_proxies_sync(entries)
+                        dht_buffer.extend(entries)
+                        if len(dht_buffer) >= DHT_BATCH_SIZE:
+                            add_proxies_sync(dht_buffer)
+                            dht_buffer.clear()
                 except Exception:
                     pass
 
                 count += 1
                 if count % DHT_LOG_EVERY == 0:
                     print(f"DHT: visited {len(visited)} nodes, proxies {len(proxy_set)}")
+            if dht_buffer:
+                add_proxies_sync(dht_buffer)
+                dht_buffer.clear()
             queue.task_done()
 
     workers = [asyncio.create_task(worker()) for _ in range(MAX_DHT_CONCURRENCY)]
     await asyncio.gather(*workers)
+    if dht_buffer:
+        add_proxies_sync(dht_buffer)
+        dht_buffer.clear()
 
 
 async def run_proxxy() -> None:

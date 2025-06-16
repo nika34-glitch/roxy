@@ -331,6 +331,25 @@ def normalize_proxy(entry: str) -> str | None:
 TEST_PROXIES = os.getenv("TEST_PROXIES", "0") == "1"
 TEST_URL = os.getenv("TEST_URL", "http://example.com")
 POOL_LIMIT = int(os.getenv("POOL_LIMIT", "50"))
+MIN_POOL_LIMIT = 5
+MAX_POOL_LIMIT = int(os.getenv("MAX_POOL_LIMIT", str((os.cpu_count() or 1) * 20)))
+CHECK_CONNECT_TIMEOUT = float(os.getenv("CHECK_CONNECT_TIMEOUT", "3"))
+CHECK_READ_TIMEOUT = float(os.getenv("CHECK_READ_TIMEOUT", "3"))
+PROXY_CACHE_TTL = int(os.getenv("PROXY_CACHE_TTL", "300"))
+
+proxy_check_time: dict[str, float] = {}
+proxy_latency: dict[str, float] = {}
+
+
+def adjust_pool_limit(success_rate: float) -> None:
+    """Adjust concurrency based on success rate."""
+    global POOL_LIMIT, aiohttp_session
+    if success_rate < 0.3 and POOL_LIMIT > MIN_POOL_LIMIT:
+        POOL_LIMIT = max(MIN_POOL_LIMIT, int(POOL_LIMIT * 0.8))
+    elif success_rate > 0.7 and POOL_LIMIT < MAX_POOL_LIMIT:
+        POOL_LIMIT = min(MAX_POOL_LIMIT, POOL_LIMIT + 5)
+    if aiohttp_session is not None:
+        aiohttp_session.connector.limit = POOL_LIMIT
 
 
 async def filter_working(proxies: list[str]) -> list[str]:
@@ -339,20 +358,86 @@ async def filter_working(proxies: list[str]) -> list[str]:
 
     session = await get_aiohttp_session()
     sem = asyncio.Semaphore(POOL_LIMIT)
+    timeout = aiohttp.ClientTimeout(
+        connect=CHECK_CONNECT_TIMEOUT, sock_read=CHECK_READ_TIMEOUT
+    )
+
+    async def socks_handshake(ip: str, port: int, proto: str) -> bool:
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port), timeout=CHECK_CONNECT_TIMEOUT
+            )
+            if proto == "socks5":
+                writer.write(b"\x05\x01\x00")
+                await writer.drain()
+                resp = await asyncio.wait_for(reader.readexactly(2), timeout=1)
+                if resp != b"\x05\x00":
+                    writer.close()
+                    await writer.wait_closed()
+                    return False
+                req = b"\x05\x01\x00\x03\x0bexample.com\x00\x50"
+                writer.write(req)
+                await writer.drain()
+                resp = await asyncio.wait_for(reader.readexactly(10), timeout=1)
+                writer.close()
+                await writer.wait_closed()
+                return resp[1] == 0x00
+            else:  # socks4
+                req = b"\x04\x01\x00\x50\x00\x00\x00\x01\x00"
+                writer.write(req)
+                await writer.drain()
+                resp = await asyncio.wait_for(reader.readexactly(8), timeout=1)
+                writer.close()
+                await writer.wait_closed()
+                return resp[1] == 0x5A
+        except Exception:
+            return False
 
     async def check(p: str) -> str | None:
         proto, ip, port = p.split(":")
-        proxy_url = f"{proto}://{ip}:{port}"
+        if p in proxy_check_time and time.monotonic() - proxy_check_time[p] < PROXY_CACHE_TTL:
+            return p
+
         try:
-            async with sem:
-                async with session.get(TEST_URL, proxy=proxy_url, timeout=5):
-                    return p
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, int(port)), timeout=CHECK_CONNECT_TIMEOUT
+            )
+            writer.close()
+            await writer.wait_closed()
         except Exception:
             return None
 
+        start = time.perf_counter()
+        try:
+            async with sem:
+                if proto.startswith("socks"):
+                    if not await socks_handshake(ip, int(port), proto):
+                        return None
+                else:
+                    proxy_url = f"{proto}://{ip}:{port}"
+                    async with session.head(
+                        TEST_URL, proxy=proxy_url, timeout=timeout
+                    ):
+                        pass
+        except Exception:
+            return None
+        latency = time.perf_counter() - start
+        proxy_latency[p] = latency
+        proxy_check_time[p] = time.monotonic()
+        return p
+
     tasks = [asyncio.create_task(check(p)) for p in proxies]
-    results = await asyncio.gather(*tasks)
-    return [r for r in results if r]
+    results: list[str] = []
+    successes = 0
+    for task in asyncio.as_completed(tasks):
+        res = await task
+        if res:
+            successes += 1
+            results.append(res)
+
+    success_rate = successes / len(proxies) if proxies else 0
+    adjust_pool_limit(success_rate)
+    return results
 
 
 async def quick_validate(proxies: list[str]) -> list[str]:
@@ -374,8 +459,16 @@ async def quick_validate(proxies: list[str]) -> list[str]:
             return None
 
     tasks = [asyncio.create_task(check(p)) for p in proxies]
-    results = await asyncio.gather(*tasks)
-    return [p for p in results if p]
+    results: list[str] = []
+    successes = 0
+    for task in asyncio.as_completed(tasks):
+        res = await task
+        if res:
+            successes += 1
+            results.append(res)
+    success_rate = successes / len(proxies) if proxies else 0
+    adjust_pool_limit(success_rate)
+    return results
 
 
 def _output_path(proto: str) -> str:
@@ -411,8 +504,13 @@ async def get_aiohttp_session() -> aiohttp.ClientSession:
         if httpx_client:
             return httpx_client
     if aiohttp_session is None:
-        connector = aiohttp.TCPConnector(limit=POOL_LIMIT)
-        aiohttp_session = aiohttp.ClientSession(connector=connector)
+        connector = aiohttp.TCPConnector(limit=POOL_LIMIT, ttl_dns_cache=60)
+        default_timeout = aiohttp.ClientTimeout(
+            connect=CHECK_CONNECT_TIMEOUT, sock_read=CHECK_READ_TIMEOUT
+        )
+        aiohttp_session = aiohttp.ClientSession(
+            connector=connector, timeout=default_timeout
+        )
     return aiohttp_session
 
 

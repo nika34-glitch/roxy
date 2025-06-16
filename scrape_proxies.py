@@ -5,8 +5,12 @@ import random
 import re
 import base64
 import asyncio
-import uvloop
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+try:
+    import uvloop
+    _HAVE_UVLOOP = True
+except Exception:
+    uvloop = None
+    _HAVE_UVLOOP = False
 from functools import lru_cache
 import os
 import socket
@@ -53,6 +57,10 @@ if OUTPUT_COMPRESSED and not OUTPUT_FILE.endswith(".gz"):
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
+if _HAVE_UVLOOP:
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+else:
+    logging.warning("uvloop import failed; using default asyncio event loop")
 
 PROXXY_SOURCES_FILE = os.path.join(
     os.path.dirname(__file__), "vendor", "proXXy", "proxy_sources.json"

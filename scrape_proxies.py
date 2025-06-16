@@ -25,6 +25,7 @@ from bs4 import BeautifulSoup
 
 MTPROTO_URL = "https://mtpro.xyz/api/?type=mtproto"
 SOCKS_URL = "https://mtpro.xyz/api/?type=socks"
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", ".")
 OUTPUT_FILE = os.getenv("OUTPUT_FILE", "proxies.txt")
 OUTPUT_COMPRESSED = os.getenv("OUTPUT_COMPRESSED", "0") == "1"
 if OUTPUT_COMPRESSED and not OUTPUT_FILE.endswith(".gz"):
@@ -278,12 +279,92 @@ write_event = asyncio.Event()
 lock = threading.Lock()
 
 
+PROTOCOL_RE = re.compile(r"^(https?|socks4|socks5)$", re.I)
+
+
+def normalize_proxy(entry: str) -> str | None:
+    """Return proxy as proto:ip:port if valid, else None."""
+    entry = entry.strip()
+    if not entry:
+        return None
+    if '://' in entry:
+        proto, rest = entry.split('://', 1)
+    elif ';' in entry:
+        proto, ip, port = entry.split(';', 2)
+        rest = f"{ip}:{port}"
+    else:
+        parts = entry.split(':')
+        if len(parts) == 2:
+            proto, rest = 'http', entry
+        elif len(parts) == 3:
+            proto, rest = parts[0], f"{parts[1]}:{parts[2]}"
+        else:
+            return None
+
+    proto = proto.lower()
+    ip_port = rest.split(':')
+    if len(ip_port) != 2:
+        return None
+    ip, port_str = ip_port
+    if not port_str.isdigit():
+        return None
+    port = int(port_str)
+    if not (1 <= port <= 65535):
+        return None
+    octets = ip.split('.')
+    if len(octets) != 4 or any(not o.isdigit() or not 0 <= int(o) <= 255 for o in octets):
+        return None
+    if not PROTOCOL_RE.match(proto):
+        proto = 'other'
+    return f"{proto}:{ip}:{port}"
+
+
+TEST_PROXIES = os.getenv("TEST_PROXIES", "0") == "1"
+TEST_URL = os.getenv("TEST_URL", "http://example.com")
+POOL_LIMIT = int(os.getenv("POOL_LIMIT", "50"))
+
+
+async def filter_working(proxies: list[str]) -> list[str]:
+    if not TEST_PROXIES:
+        return proxies
+
+    connector = aiohttp.TCPConnector(limit=POOL_LIMIT)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        sem = asyncio.Semaphore(POOL_LIMIT)
+
+        async def check(p: str) -> str | None:
+            proto, ip, port = p.split(":")
+            proxy_url = f"{proto}://{ip}:{port}"
+            try:
+                async with sem:
+                    async with session.get(TEST_URL, proxy=proxy_url, timeout=5):
+                        return p
+            except Exception:
+                return None
+
+        tasks = [asyncio.create_task(check(p)) for p in proxies]
+        results = await asyncio.gather(*tasks)
+    return [r for r in results if r]
+
+
+def _output_path(proto: str) -> str:
+    base = f"{proto}_" + os.path.basename(OUTPUT_FILE)
+    return os.path.join(OUTPUT_DIR, base)
+
+
 def write_entries(entries: list[str]) -> None:
-    mode = "at" if OUTPUT_COMPRESSED else "a"
-    opener = gzip.open if OUTPUT_COMPRESSED else open
-    with opener(OUTPUT_FILE, mode) as f:
-        for p in entries:
-            f.write(p + "\n")
+    proto_groups: dict[str, list[str]] = {}
+    for p in entries:
+        proto = p.split(":", 1)[0]
+        proto_groups.setdefault(proto, []).append(p)
+
+    for proto, items in proto_groups.items():
+        path = _output_path(proto)
+        mode = "at" if OUTPUT_COMPRESSED else "a"
+        opener = gzip.open if OUTPUT_COMPRESSED else open
+        with opener(path, mode) as f:
+            for line in items:
+                f.write(line + "\n")
 
 
 async def get_aiohttp_session() -> aiohttp.ClientSession:
@@ -296,11 +377,13 @@ async def get_aiohttp_session() -> aiohttp.ClientSession:
 async def add_proxies(proxies: List[str]) -> None:
     async with proxy_lock:
         added = False
-        for p in proxies:
-            if p not in proxy_set:
-                proxy_set.add(p)
-                new_entries.append(p)
-                added = True
+        for raw in proxies:
+            p = normalize_proxy(raw)
+            if not p or p in proxy_set:
+                continue
+            proxy_set.add(p)
+            new_entries.append(p)
+            added = True
         if added:
             write_event.set()
 
@@ -308,11 +391,13 @@ async def add_proxies(proxies: List[str]) -> None:
 def add_proxies_sync(proxies: List[str]) -> None:
     added = False
     with lock:
-        for p in proxies:
-            if p not in proxy_set:
-                proxy_set.add(p)
-                new_entries.append(p)
-                added = True
+        for raw in proxies:
+            p = normalize_proxy(raw)
+            if not p or p in proxy_set:
+                continue
+            proxy_set.add(p)
+            new_entries.append(p)
+            added = True
     if added:
         write_event.set()
 
@@ -327,6 +412,7 @@ async def writer_loop() -> None:
                 continue
             entries = list(new_entries)
             new_entries.clear()
+        entries = await filter_working(entries)
         await asyncio.to_thread(write_entries, entries)
 
 
@@ -911,7 +997,7 @@ def scrape_spys() -> None:
                 resp = requests.get(url, timeout=10)
                 resp.raise_for_status()
                 for ip, port in _parse_spys_list(resp.text):
-                    proxies.append(f"{proto};{ip};{port}")
+                    proxies.append(f"{proto}:{ip}:{port}")
             except Exception as e:
                 print(f"Error fetching {url}: {e}", file=sys.stderr)
             time.sleep(1)

@@ -21,22 +21,58 @@ import json
 import ssl
 import importlib.util
 from pathlib import Path
-from typing import AsyncGenerator, List
+from typing import Any, AsyncGenerator, List
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
 import gzip
 from io import StringIO
-import orjson
-import regex
+try:
+    import orjson  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    orjson = None  # type: ignore
+
+try:
+    import regex  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    import re as regex
 import logging
 import ipaddress
 import itertools
 import aiofiles
-import aiodns
+
+# Older versions of ``aiofiles`` may not expose a ``BaseFile`` class.  This
+# attribute is only used for type hints, so provide a minimal stub when
+# missing to avoid ``AttributeError`` at import time.
+if not hasattr(aiofiles, "BaseFile"):
+    class _BF:
+        pass
+
+
+    aiofiles.BaseFile = _BF  # type: ignore[attr-defined]
+
+try:
+    import aiodns  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    aiodns = None  # type: ignore
+
 import csv
 import bisect
 from collections import defaultdict
-from pybloom_live import ScalableBloomFilter
+
+try:
+    from pybloom_live import ScalableBloomFilter  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    class ScalableBloomFilter:  # minimal stub
+        SMALL_SET_GROWTH = 2
+
+        def __init__(self, *_, **__):
+            pass
+
+        def add(self, item):
+            return True
+
+        def __contains__(self, item):
+            return False
 try:
     from score_cython import score_single_proxy as cy_score_single_proxy
 except Exception:
@@ -52,8 +88,15 @@ except ModuleNotFoundError:
 
     logging.warning("proxyhub module not found, disabling ProxyHub scraping")
 
-import aiohttp
-from bs4 import BeautifulSoup
+try:
+    import aiohttp  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    aiohttp = None  # type: ignore
+
+try:
+    from bs4 import BeautifulSoup  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    BeautifulSoup = None  # type: ignore
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
 
@@ -309,13 +352,20 @@ if os.path.exists(CONFIG_FILE):
         logging.error("Error loading config %s: %s", CONFIG_FILE, exc)
 
 requests_session = requests.Session()
-aiohttp_session: aiohttp.ClientSession | None = None
+aiohttp_session: Any | None = None
 httpx_client = None
 USE_HTTP2 = os.getenv("USE_HTTP2", "0") == "1"
 MAIN_LOOP: asyncio.AbstractEventLoop | None = None
 
 proxy_set: ScalableBloomFilter = ScalableBloomFilter(mode=ScalableBloomFilter.SMALL_SET_GROWTH)
-DNS_RESOLVER = aiodns.DNSResolver()
+if aiodns is not None:
+    DNS_RESOLVER = aiodns.DNSResolver()
+else:  # pragma: no cover - optional dependency missing
+    class _DummyResolver:
+        async def gethostbyname(self, host, family):
+            raise RuntimeError("aiodns not available")
+
+    DNS_RESOLVER = _DummyResolver()
 SOURCE_BACKOFF: defaultdict[str, int] = defaultdict(int)
 proxy_lock = asyncio.Lock()
 new_entries: asyncio.Queue[str] = asyncio.Queue()
@@ -1314,7 +1364,7 @@ async def filter_p2(proxies: list[str]) -> list[tuple[str, int]]:
 
 
 
-async def get_aiohttp_session() -> aiohttp.ClientSession:
+async def get_aiohttp_session() -> Any:
     global aiohttp_session, httpx_client
     if USE_HTTP2:
         if httpx_client is None:
@@ -1396,7 +1446,7 @@ async def writer_loop() -> None:
 async def fetch_json(url: str) -> dict:
     """Fetch JSON from ``url`` using the configured HTTP client."""
     session = await get_aiohttp_session()
-    if isinstance(session, aiohttp.ClientSession):
+    if aiohttp is not None and isinstance(session, aiohttp.ClientSession):
         async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
             resp.raise_for_status()
             data = await resp.read()
@@ -1565,7 +1615,7 @@ async def fetch_with_backoff(url: str, max_retries: int = 5) -> str:
             if (
                 USE_HTTP2
                 and hasattr(session, "get")
-                and not isinstance(session, aiohttp.ClientSession)
+                and (aiohttp is None or not isinstance(session, aiohttp.ClientSession))
             ):
                 resp = await session.get(url, headers=headers)
                 if resp.status == 429:
@@ -2372,7 +2422,7 @@ async def run_proxxy() -> None:
         await asyncio.sleep(interval)
 
 
-async def parse_list(session: aiohttp.ClientSession, url: str) -> list:
+async def parse_list(session: Any, url: str) -> list:
     async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
         text = await resp.text()
     return [line.strip() for line in text.splitlines() if line.strip()]

@@ -21,6 +21,9 @@ import logging
 import ipaddress
 import itertools
 import aiofiles
+import csv
+import bisect
+from collections import defaultdict
 
 from proxyhub import SOURCE_LIST, fetch_source
 
@@ -301,9 +304,12 @@ WEIGHTS = {
     "fresh": 83,
     "nettype": 83,
     "asn": 83,
+    "err_rate": 48,
+    "geo": 48,
+    "latency": 48,
 }
 CRITICAL_MIN = 325
-OVERALL_MIN = 600
+OVERALL_MIN = 700
 
 # JA3 / ASN data and history tracking
 JA3_CACHE_TTL = 1800  # seconds
@@ -312,6 +318,22 @@ HISTORY: dict[str, tuple[float, int]] = {}
 KNOWN_BAD_JA3: set[str] = set()
 ASN_TYPE: dict[int, str] = {}
 CLOUD_ASNS: set[int] = set()
+
+# GeoIP / error rate tracking
+GEO_DATA: list[tuple[int, int, str]] = []
+_geo_loaded = False
+ALLOWED_COUNTRIES = {"IT"}
+EU_COUNTRIES = {
+    "AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU",
+    "IE","IT","LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE"
+}
+
+ERR_STATS: defaultdict[str, dict] = defaultdict(
+    lambda: {"tries": 0, "fails": 0, "ts": time.time()}
+)
+
+LATENCY_CACHE_TTL = 900  # seconds
+_latency_cache: dict[str, tuple[float | None, float]] = {}
 
 # TLS caching and blacklist structures
 TLS_CACHE_TTL = 900  # seconds
@@ -436,6 +458,111 @@ async def load_asn_metadata() -> None:
     ASN_TYPE, CLOUD_ASNS = await asyncio.gather(load_map, load_cloud)
 
 
+async def load_geoip() -> None:
+    """Load GeoIP CSV into memory."""
+    global GEO_DATA, _geo_loaded
+    if _geo_loaded:
+        return
+
+    path = Path(__file__).resolve().parent / "data" / "geo" / "ip2country.csv"
+
+    def _load() -> list[tuple[int, int, str]]:
+        if not path.exists():
+            return []
+        rows: list[tuple[int, int, str]] = []
+        with open(path, newline="") as f:
+            reader = csv.reader(f)
+            next(reader, None)
+            for row in reader:
+                if len(row) < 3:
+                    continue
+                try:
+                    start = int(row[0])
+                    end = int(row[1])
+                except Exception:
+                    try:
+                        start = int(ipaddress.ip_address(row[0]))
+                        end = int(ipaddress.ip_address(row[1]))
+                    except Exception:
+                        continue
+                cc = row[2].strip().upper()
+                rows.append((start, end, cc))
+        rows.sort(key=lambda r: r[0])
+        return rows
+
+    GEO_DATA = await asyncio.to_thread(_load)
+    _geo_loaded = True
+
+
+def geo_lookup(ip: str) -> str | None:
+    """Return two-letter country code using the loaded CSV; None if not found."""
+    if not GEO_DATA:
+        return None
+    ip_int = int(ipaddress.ip_address(ip))
+    idx = bisect.bisect_left(GEO_DATA, (ip_int, 0, ""))
+    if idx < len(GEO_DATA):
+        start, end, cc = GEO_DATA[idx]
+        if start <= ip_int <= end:
+            return cc
+    if idx > 0:
+        start, end, cc = GEO_DATA[idx - 1]
+        if start <= ip_int <= end:
+            return cc
+    return None
+
+
+def record_attempt(ip: str, success: bool) -> None:
+    """Increment ERR_STATS and prune entries older than 60 min."""
+    now = time.time()
+    data = ERR_STATS[ip]
+    if now - data["ts"] > 3600:
+        data["tries"] = 0
+        data["fails"] = 0
+        data["ts"] = now
+    data["tries"] += 1
+    if not success:
+        data["fails"] += 1
+    for key in list(ERR_STATS.keys()):
+        if now - ERR_STATS[key]["ts"] > 3600:
+            del ERR_STATS[key]
+
+
+def calc_err_rate(ip: str) -> float:
+    """Return fails / tries over last hour; optimistic if tries < 20."""
+    data = ERR_STATS.get(ip)
+    if not data or data["tries"] < 20:
+        return 0.0
+    return data["fails"] / data["tries"]
+
+
+async def measure_latency(ip: str, port: int, proto: str) -> float | None:
+    """Return milliseconds from connect start to TLS handshake complete."""
+    key = f"{ip}:{port}"
+    now = time.monotonic()
+    cached = _latency_cache.get(key)
+    if cached and now - cached[1] < LATENCY_CACHE_TTL:
+        return cached[0]
+
+    ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        start = time.perf_counter()
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, port, ssl=ctx),
+            timeout=1,
+        )
+        latency_ms = (time.perf_counter() - start) * 1000.0
+        writer.close()
+        await writer.wait_closed()
+        record_attempt(ip, True)
+        _latency_cache[key] = (latency_ms, now)
+        return latency_ms
+    except Exception:
+        record_attempt(ip, False)
+        _latency_cache[key] = (None, now)
+        return None
+
+
 def _ip_rep_factor(ip: ipaddress._BaseAddress) -> float:
     for net in _hard_blacklists:
         if ip in net:
@@ -463,21 +590,29 @@ async def _tls_factor(ip: str, port: int, ctx: ssl.SSLContext) -> float:
             await writer.wait_closed()
         except Exception:
             tls_cache[key] = (0.0, now)
+            _latency_cache[key] = (None, now)
+            record_attempt(ip, False)
             return 0.0
 
         try:
+            start = time.perf_counter()
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(ip, port, ssl=ctx),
                 timeout=1,
             )
+            latency_ms = (time.perf_counter() - start) * 1000.0
             cipher = writer.get_extra_info("cipher")
             writer.close()
             await writer.wait_closed()
+            _latency_cache[key] = (latency_ms, now)
+            record_attempt(ip, True)
             if cipher and cipher[0] != "NULL":
                 val = 1.0
             else:
                 val = 0.5
         except Exception:
+            _latency_cache[key] = (None, now)
+            record_attempt(ip, False)
             val = 0.5
 
     tls_cache[key] = (val, now)
@@ -705,6 +840,7 @@ async def _filter_chunk(proxies: list[str]) -> list[str]:
         if p in proxy_check_time and time.monotonic() - proxy_check_time[p] < ttl:
             return p
 
+        success = False
         for attempt in range(MAX_RETRIES + 1):
             try:
                 reader, writer = await asyncio.wait_for(
@@ -715,7 +851,7 @@ async def _filter_chunk(proxies: list[str]) -> list[str]:
                 await writer.wait_closed()
             except Exception:
                 if attempt >= MAX_RETRIES:
-                    return None
+                    break
                 await asyncio.sleep(2 ** attempt)
                 continue
 
@@ -738,12 +874,14 @@ async def _filter_chunk(proxies: list[str]) -> list[str]:
                 latency = time.perf_counter() - start
                 proxy_latency[p] = latency
                 proxy_check_time[p] = time.monotonic()
-                return p
+                success = True
+                break
             except Exception:
                 if attempt >= MAX_RETRIES:
-                    return None
+                    break
                 await asyncio.sleep(2 ** attempt)
-        return None
+        record_attempt(ip, success)
+        return p if success else None
 
     tasks = [asyncio.create_task(check(p)) for p in proxies]
     gathered = await asyncio.gather(*tasks, return_exceptions=True)
@@ -775,8 +913,10 @@ async def quick_validate(proxies: list[str]) -> list[str]:
                 )
                 writer.close()
                 await writer.wait_closed()
+            record_attempt(ip, True)
             return p
         except Exception:
+            record_attempt(p.split(":")[1], False)
             return None
 
     tasks = [asyncio.create_task(check(p)) for p in proxies]
@@ -973,7 +1113,47 @@ async def _score_single_proxy(p: str, ctx: ssl.SSLContext) -> tuple[str, int, di
     net_points = int(net_factor * WEIGHTS["nettype"])
     asn_points = int(asn_factor * WEIGHTS["asn"])
 
-    total_score = int(critical_score + ja3_points + fresh_points + net_points + asn_points)
+    country = geo_lookup(ip)
+    if country is None:
+        logging.debug("Geo lookup failed for %s", ip)
+    if country in ALLOWED_COUNTRIES:
+        geo_factor = 1.0
+    elif country in EU_COUNTRIES:
+        geo_factor = 0.5
+    else:
+        geo_factor = 0.0
+    geo_points = int(geo_factor * WEIGHTS["geo"])
+
+    err_rate = calc_err_rate(ip)
+    if err_rate < 0.01:
+        err_factor = 1.0
+    elif err_rate <= 0.05:
+        err_factor = 0.5
+    else:
+        err_factor = 0.0
+    err_points = int(err_factor * WEIGHTS["err_rate"])
+
+    latency = await measure_latency(ip, int(port), proto)
+    if latency is None:
+        lat_factor = 0.0
+    elif 20 <= latency <= 150:
+        lat_factor = 1.0
+    elif latency <= 350:
+        lat_factor = 0.5
+    else:
+        lat_factor = 0.0
+    lat_points = int(lat_factor * WEIGHTS["latency"])
+
+    total_score = int(
+        critical_score
+        + ja3_points
+        + fresh_points
+        + net_points
+        + asn_points
+        + err_points
+        + geo_points
+        + lat_points
+    )
 
     if total_score < OVERALL_MIN or critical_score < CRITICAL_MIN:
         update_ip_history(ip, False)
@@ -988,6 +1168,9 @@ async def _score_single_proxy(p: str, ctx: ssl.SSLContext) -> tuple[str, int, di
         "fresh": fresh_points,
         "net": net_points,
         "asn": asn_points,
+        "err": err_points,
+        "geo": geo_points,
+        "lat": lat_points,
     }
     return norm, total_score, scores
 
@@ -998,6 +1181,7 @@ async def filter_p2(proxies: list[str]) -> list[tuple[str, int]]:
     await load_blacklists()
     await load_ja3_sets()
     await load_asn_metadata()
+    await load_geoip()
     ctx = ssl.create_default_context()
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
@@ -2208,13 +2392,15 @@ if __name__ == "__main__":
             await load_blacklists()
             await load_ja3_sets()
             await load_asn_metadata()
+            await load_geoip()
             res = await _score_single_proxy(proxy, ctx)
             if not res:
                 return 1
             p, total, parts = res
             print(
                 f"{p} score={total} ip={parts['ip']} proto={parts['proto']} tls={parts['tls']} "
-                f"ja3={parts['ja3']} fresh={parts['fresh']} net={parts['net']} asn={parts['asn']}"
+                f"ja3={parts['ja3']} fresh={parts['fresh']} net={parts['net']} asn={parts['asn']} "
+                f"err={parts['err']} geo={parts['geo']} lat={parts['lat']}"
             )
             return 0
 

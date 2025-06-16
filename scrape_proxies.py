@@ -221,6 +221,16 @@ SPYS_INTERVAL = 300  # fetch every 5 minutes
 PROXYBROS_URL = "https://proxybros.com/free-proxy-list/"
 PROXYBROS_INTERVAL = 600  # fetch every 10 minutes
 
+# openproxylist.xyz raw lists
+OPENPROXYLIST_INTERVAL = 900        # seconds between full cycles
+OPENPROXYLIST_CONCURRENCY = 4       # how many lists to fetch in parallel
+OPENPROXYLIST_ENDPOINTS = [
+    "https://openproxylist.xyz/http.txt",
+    "https://openproxylist.xyz/https.txt",
+    "https://openproxylist.xyz/socks4.txt",
+    "https://openproxylist.xyz/socks5.txt",
+]
+
 SCRAPERS = {
     "mtpro": MT_INTERVAL,
     "paste": PASTE_INTERVAL,
@@ -242,6 +252,7 @@ SCRAPERS = {
     "kangproxy": KANGPROXY_INTERVAL,
     "spys": SPYS_INTERVAL,
     "proxybros": PROXYBROS_INTERVAL,
+    "openproxylist": OPENPROXYLIST_INTERVAL,
     "gatherproxy": GATHER_PROXY_INTERVAL,
     "bloody": BLOODY_INTERVAL,
     "proxxy": 300,
@@ -1352,6 +1363,34 @@ async def run_proxxy() -> None:
         await asyncio.sleep(interval)
 
 
+async def parse_list(session: aiohttp.ClientSession, url: str) -> list:
+    async with session.get(url) as resp:
+        text = await resp.text()
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+async def scrape_openproxylist(interval: float, concurrency: int):
+    sem = asyncio.Semaphore(concurrency)
+    session = aiohttp.ClientSession()
+    while True:
+        tasks = []
+        for url in OPENPROXYLIST_ENDPOINTS:
+            async with sem:
+                tasks.append(parse_list(session, url))
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        with lock:
+            added = False
+            for proxies in results:
+                if isinstance(proxies, list):
+                    for p in proxies:
+                        if p not in proxy_set:
+                            proxy_set.add(p)
+                            added = True
+            if added:
+                write_proxies_to_file()
+        await asyncio.sleep(interval)
+
+
 async def scrape_proxyhub(interval: float, concurrency: int) -> None:
     """Run ProxyHub's asynchronous fetcher alongside other scrapers."""
 
@@ -1508,6 +1547,15 @@ def main() -> None:
         threading.Thread(
             target=lambda: asyncio.run(
                 scrape_gatherproxy(GATHER_PROXY_INTERVAL, GATHER_PROXY_CONCURRENCY)
+            ),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=lambda: asyncio.run(
+                scrape_openproxylist(
+                    OPENPROXYLIST_INTERVAL,
+                    OPENPROXYLIST_CONCURRENCY,
+                )
             ),
             daemon=True,
         ),

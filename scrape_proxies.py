@@ -24,6 +24,8 @@ from proxyhub import SOURCE_LIST, fetch_source
 import aiohttp
 from bs4 import BeautifulSoup
 
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
+
 MTPROTO_URL = "https://mtpro.xyz/api/?type=mtproto"
 SOCKS_URL = "https://mtpro.xyz/api/?type=socks"
 OUTPUT_DIR = os.getenv("OUTPUT_DIR", ".")
@@ -62,6 +64,10 @@ USER_AGENTS = [
 ]
 
 PROXY_RE = regex.compile(r"((?:\d{1,3}\.){3}\d{1,3}):(\d{1,5})")
+IP_PORT_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$")
+PROTO_PARAM_RE = re.compile(r"protocol=([^&]+)")
+FREE_CZ_BASE64_RE = re.compile(r'Base64.decode\("([^"]+)"\)')
+FREE_CZ_PAGE_RE = re.compile(r"/en/proxylist/main/(\d+)")
 
 # IRC collection configuration
 IRC_SERVERS = [
@@ -257,6 +263,18 @@ SCRAPERS = {
     "proxxy": 300,
 }
 
+# Load optional configuration overrides
+CONFIG_FILE = os.getenv("CONFIG_FILE", "config.json")
+if os.path.exists(CONFIG_FILE):
+    try:
+        with open(CONFIG_FILE) as f:
+            cfg = json.load(f)
+        for k, v in cfg.items():
+            if k.isupper():
+                globals()[k] = v
+    except Exception as exc:
+        logging.error("Error loading config %s: %s", CONFIG_FILE, exc)
+
 requests_session = requests.Session()
 aiohttp_session: aiohttp.ClientSession | None = None
 httpx_client = None
@@ -319,23 +337,45 @@ async def filter_working(proxies: list[str]) -> list[str]:
     if not TEST_PROXIES:
         return proxies
 
-    connector = aiohttp.TCPConnector(limit=POOL_LIMIT)
-    async with aiohttp.ClientSession(connector=connector) as session:
-        sem = asyncio.Semaphore(POOL_LIMIT)
+    session = await get_aiohttp_session()
+    sem = asyncio.Semaphore(POOL_LIMIT)
 
-        async def check(p: str) -> str | None:
-            proto, ip, port = p.split(":")
-            proxy_url = f"{proto}://{ip}:{port}"
-            try:
-                async with sem:
-                    async with session.get(TEST_URL, proxy=proxy_url, timeout=5):
-                        return p
-            except Exception:
-                return None
+    async def check(p: str) -> str | None:
+        proto, ip, port = p.split(":")
+        proxy_url = f"{proto}://{ip}:{port}"
+        try:
+            async with sem:
+                async with session.get(TEST_URL, proxy=proxy_url, timeout=5):
+                    return p
+        except Exception:
+            return None
 
-        tasks = [asyncio.create_task(check(p)) for p in proxies]
-        results = await asyncio.gather(*tasks)
+    tasks = [asyncio.create_task(check(p)) for p in proxies]
+    results = await asyncio.gather(*tasks)
     return [r for r in results if r]
+
+
+async def quick_validate(proxies: list[str]) -> list[str]:
+    """Check that proxy ports are reachable."""
+    sem = asyncio.Semaphore(POOL_LIMIT)
+
+    async def check(p: str) -> str | None:
+        try:
+            _, ip, port = p.split(":")
+            async with sem:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(ip, int(port)),
+                    timeout=1,
+                )
+                writer.close()
+                await writer.wait_closed()
+            return p
+        except Exception:
+            return None
+
+    tasks = [asyncio.create_task(check(p)) for p in proxies]
+    results = await asyncio.gather(*tasks)
+    return [p for p in results if p]
 
 
 def _output_path(proto: str) -> str:
@@ -371,7 +411,8 @@ async def get_aiohttp_session() -> aiohttp.ClientSession:
         if httpx_client:
             return httpx_client
     if aiohttp_session is None:
-        aiohttp_session = aiohttp.ClientSession()
+        connector = aiohttp.TCPConnector(limit=POOL_LIMIT)
+        aiohttp_session = aiohttp.ClientSession(connector=connector)
     return aiohttp_session
 
 
@@ -413,6 +454,7 @@ async def writer_loop() -> None:
                 continue
             entries = list(new_entries)
             new_entries.clear()
+        entries = await quick_validate(entries)
         entries = await filter_working(entries)
         await asyncio.to_thread(write_entries, entries)
         if len(proxy_set) > MAX_PROXY_SET_SIZE:
@@ -422,7 +464,7 @@ async def writer_loop() -> None:
 
 async def fetch_json(url: str) -> dict:
     session = await get_aiohttp_session()
-    async with session.get(url, timeout=10) as resp:
+    async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
         resp.raise_for_status()
         data = await resp.read()
         return orjson.loads(data)
@@ -441,24 +483,24 @@ async def fetch_proxxy_sources() -> AsyncGenerator[List[str], None]:
     for url_list in sources.values():
         urls.extend(url_list)
 
-    async with aiohttp.ClientSession() as session:
-        tasks = {asyncio.create_task(session.get(url, timeout=10)): url for url in urls}
-        batch: List[str] = []
-        for task in asyncio.as_completed(tasks):
-            url = tasks[task]
-            try:
-                resp = await task
-                async for raw_line in resp.content:
-                    line = raw_line.decode(errors="ignore").strip()
-                    if re.match(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$", line):
-                        batch.append(line)
-                        if len(batch) >= 1000:
-                            yield batch
-                            batch = []
-            except Exception as e:
-                logging.error("proXXy source error %s: %s", url, e)
-        if batch:
-            yield batch
+    session = await get_aiohttp_session()
+    tasks = {asyncio.create_task(session.get(url, timeout=REQUEST_TIMEOUT)): url for url in urls}
+    batch: List[str] = []
+    for task in asyncio.as_completed(tasks):
+        url = tasks[task]
+        try:
+            resp = await task
+            async for raw_line in resp.content:
+                line = raw_line.decode(errors="ignore").strip()
+                if IP_PORT_RE.match(line):
+                    batch.append(line)
+                    if len(batch) >= 1000:
+                        yield batch
+                        batch = []
+        except Exception as e:
+            logging.error("proXXy source error %s: %s", url, e)
+    if batch:
+        yield batch
 
 
 async def scrape_mt_proxies() -> None:
@@ -526,7 +568,7 @@ def _parse_free_proxy_cz_page(soup: BeautifulSoup) -> list[str]:
         script = row.find("script")
         if not script or not script.string:
             continue
-        m = re.search(r'Base64.decode\("([^"]+)"\)', script.string)
+        m = FREE_CZ_BASE64_RE.search(script.string)
         if not m:
             continue
         try:
@@ -556,7 +598,7 @@ async def scrape_free_proxy_cz() -> None:
         proxies.extend(_parse_free_proxy_cz_page(soup))
         links = soup.select('a[href^="/en/proxylist/main/"]')
         for a in links:
-            m = re.search(r"/en/proxylist/main/(\d+)", a.get("href", ""))
+            m = FREE_CZ_PAGE_RE.search(a.get("href", ""))
             if m:
                 pages = max(pages, int(m.group(1)))
         for page in range(2, pages + 1):
@@ -591,7 +633,7 @@ async def fetch_with_backoff(url: str, max_retries: int = 5) -> str:
                 resp = await session.get(url, headers=headers)
                 resp.raise_for_status()
                 return resp.text
-            async with session.get(url, headers=headers, timeout=10) as resp:
+            async with session.get(url, headers=headers, timeout=REQUEST_TIMEOUT) as resp:
                 if resp.status >= 400:
                     raise aiohttp.ClientResponseError(
                         resp.request_info, resp.history, status=resp.status
@@ -675,7 +717,7 @@ async def scrape_proxyscrape() -> None:
 def _ps_get(url: str) -> str:
     """Helper for ProxyScraper integration to fetch a URL with error logging."""
     try:
-        resp = requests.get(url, timeout=10)
+        resp = requests.get(url, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
         return resp.text
     except Exception as exc:
@@ -693,11 +735,11 @@ def scrape_proxyscraper_sources(interval: int = PS_INTERVAL) -> None:
             subset = urls[i : i + batch]
             texts = list(SHARED_THREAD_POOL.map(_ps_get, subset))
             for url, text in zip(subset, texts):
-                proto_match = re.search(r"protocol=([^&]+)", url)
+                proto_match = PROTO_PARAM_RE.search(url)
                 proto = proto_match.group(1).lower() if proto_match else "http"
                 for line in text.splitlines():
                     line = line.strip()
-                    if re.match(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$", line):
+                    if IP_PORT_RE.match(line):
                         new_entries.append(f"{proto}:{line}")
 
         if new_entries:
@@ -711,7 +753,7 @@ def download_proxy_list(urls: list[tuple[str, str]]) -> list[str]:
     entries: list[str] = []
     for url, proto in urls:
         try:
-            resp = requests.get(url, timeout=10)
+            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             for line in resp.text.splitlines():
                 line = line.strip()
@@ -833,7 +875,7 @@ async def scrape_proxy_list_sites() -> None:
                 t = textarea.get_text()
                 for line in t.splitlines():
                     line = line.strip()
-                    if re.match(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$", line):
+                    if IP_PORT_RE.match(line):
                         proxies.append(f"{proto}:{line}")
             else:
                 for row in soup.select("table tbody tr"):
@@ -841,10 +883,7 @@ async def scrape_proxy_list_sites() -> None:
                     if len(cols) >= 2:
                         ip = cols[0].get_text(strip=True)
                         port = cols[1].get_text(strip=True)
-                        if (
-                            re.match(r"^(?:\d{1,3}\.){3}\d{1,3}$", ip)
-                            and port.isdigit()
-                        ):
+                        if IP_PORT_RE.match(f"{ip}:{port}"):
                             proxies.append(f"{proto}:{ip}:{port}")
             if proxies:
                 await add_proxies(proxies)
@@ -862,7 +901,7 @@ def scrape_proxy_list_download() -> None:
         for proto in types:
             url = f"https://www.proxy-list.download/api/v1/get?type={proto}"
             try:
-                resp = requests.get(url, timeout=10)
+                resp = requests.get(url, timeout=REQUEST_TIMEOUT)
                 resp.raise_for_status()
                 for line in resp.text.splitlines():
                     line = line.strip()
@@ -903,7 +942,7 @@ def scrape_freshproxy() -> None:
     while True:
         proxies = []
         for line in download_proxy_list(urls):
-            if re.match(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$", line.split(":", 1)[1]):
+            if IP_PORT_RE.match(line.split(":", 1)[1]):
                 proxies.append(line)
         if proxies:
             add_proxies_sync(proxies)
@@ -931,7 +970,7 @@ def scrape_freeproxy_all() -> None:
     while True:
         proxies = []
         try:
-            resp = requests.get(FREEPROXY_ALL_URL, timeout=10)
+            resp = requests.get(FREEPROXY_ALL_URL, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
             for line in resp.text.splitlines():
                 line = line.strip()
@@ -940,7 +979,7 @@ def scrape_freeproxy_all() -> None:
                 if "://" in line:
                     proto, rest = line.split("://", 1)
                     proxies.append(f"{proto.lower()}:{rest}")
-                elif re.match(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$", line):
+                elif IP_PORT_RE.match(line):
                     proxies.append(f"http:{line}")
         except Exception as e:
             logging.error("Error fetching %s: %s", FREEPROXY_ALL_URL, e)
@@ -958,7 +997,7 @@ def scrape_kangproxy() -> None:
         proxies = []
         for url in urls:
             try:
-                resp = requests.get(url, timeout=10)
+                resp = requests.get(url, timeout=REQUEST_TIMEOUT)
                 resp.raise_for_status()
                 for line in resp.text.splitlines():
                     line = line.strip()
@@ -967,7 +1006,7 @@ def scrape_kangproxy() -> None:
                     if "://" in line:
                         proto, rest = line.split("://", 1)
                         proxies.append(f"{proto.lower()}:{rest}")
-                    elif re.match(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$", line):
+                    elif IP_PORT_RE.match(line):
                         proxies.append(f"http:{line}")
             except Exception as e:
                 logging.error("Error fetching %s: %s", url, e)
@@ -995,7 +1034,7 @@ def _parse_spys_list(text: str) -> list[tuple[str, str]]:
         ):
             continue
         ip_port = line.split()[0]
-        if re.match(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$", ip_port):
+        if IP_PORT_RE.match(ip_port):
             ip, port = ip_port.split(":", 1)
             proxies.append((ip, port))
     return proxies
@@ -1012,7 +1051,7 @@ def scrape_spys() -> None:
         proxies = []
         for url, proto in urls:
             try:
-                resp = requests.get(url, timeout=10)
+                resp = requests.get(url, timeout=REQUEST_TIMEOUT)
                 resp.raise_for_status()
                 for ip, port in _parse_spys_list(resp.text):
                     proxies.append(f"{proto}:{ip}:{port}")
@@ -1033,9 +1072,9 @@ def scrape_proxybros() -> None:
         proxies = []
         try:
             headers = {"User-Agent": random.choice(USER_AGENTS)}
-            resp = requests.get(PROXYBROS_URL, headers=headers, timeout=10)
+            resp = requests.get(PROXYBROS_URL, headers=headers, timeout=REQUEST_TIMEOUT)
             resp.raise_for_status()
-            soup = BeautifulSoup(resp.text, "html.parser")
+            soup = BeautifulSoup(resp.text, "lxml")
             for row in soup.select("table.proxylist-table tbody tr"):
                 ip_el = row.select_one("span.proxy-ip[data-ip]")
                 port_el = row.select_one("td[data-port]")
@@ -1345,14 +1384,14 @@ async def run_proxxy() -> None:
 
 
 async def parse_list(session: aiohttp.ClientSession, url: str) -> list:
-    async with session.get(url) as resp:
+    async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
         text = await resp.text()
     return [line.strip() for line in text.splitlines() if line.strip()]
 
 
 async def scrape_openproxylist(interval: float, concurrency: int):
     sem = asyncio.Semaphore(concurrency)
-    session = aiohttp.ClientSession()
+    session = await get_aiohttp_session()
     while True:
         tasks = []
         for url in OPENPROXYLIST_ENDPOINTS:
@@ -1434,39 +1473,39 @@ async def scrape_gatherproxy(interval: float, concurrency: int):
     sem = asyncio.Semaphore(concurrency)
     while True:
         proxies: list[tuple[str, str, str, str, int]] = []
-        async with aiohttp.ClientSession() as session:
+        session = await get_aiohttp_session()
 
-            async def fetch_page(page: int) -> str:
-                async with sem:
-                    resp = await session.post(
-                        GATHER_PROXY_URI,
-                        data={
-                            "Type": "Elite",
-                            "PageIdx": page,
-                            "Uptime": GATHER_PROXY_MIN_UPTIME,
-                        },
-                        timeout=10,
-                    )
-                    return await resp.text()
+        async def fetch_page(page: int) -> str:
+            async with sem:
+                resp = await session.post(
+                    GATHER_PROXY_URI,
+                    data={
+                        "Type": "Elite",
+                        "PageIdx": page,
+                        "Uptime": GATHER_PROXY_MIN_UPTIME,
+                    },
+                    timeout=REQUEST_TIMEOUT,
+                )
+                return await resp.text()
 
+        try:
+            first = await fetch_page(1)
+        except Exception as e:
+            logging.error("gatherproxy page 1 error: %s", e)
+            await asyncio.sleep(interval)
+            continue
+
+        proxies.extend(_parse_gatherproxy(first))
+        pages = _gp_page_count(first)
+
+        tasks = [asyncio.create_task(fetch_page(p)) for p in range(2, pages + 1)]
+        for task in asyncio.as_completed(tasks):
             try:
-                first = await fetch_page(1)
+                html = await task
             except Exception as e:
-                logging.error("gatherproxy page 1 error: %s", e)
-                await asyncio.sleep(interval)
+                logging.error("gatherproxy fetch error: %s", e)
                 continue
-
-            proxies.extend(_parse_gatherproxy(first))
-            pages = _gp_page_count(first)
-
-            tasks = [asyncio.create_task(fetch_page(p)) for p in range(2, pages + 1)]
-            for task in asyncio.as_completed(tasks):
-                try:
-                    html = await task
-                except Exception as e:
-                    logging.error("gatherproxy fetch error: %s", e)
-                    continue
-                proxies.extend(_parse_gatherproxy(html))
+            proxies.extend(_parse_gatherproxy(html))
 
         if proxies:
             entries = [

@@ -134,6 +134,12 @@ GEONODE_URL = (
 )
 GEONODE_INTERVAL = 5  # seconds between geonode API requests
 
+# GatherProxy scraping configuration
+GATHER_PROXY_URI = "http://www.gatherproxy.com/proxylist/anonymity/"
+GATHER_PROXY_INTERVAL = 600       # seconds between full GatherProxy cycles
+GATHER_PROXY_CONCURRENCY = 5      # how many pages to fetch in parallel
+GATHER_PROXY_MIN_UPTIME = 0       # Uptime filter
+
 # ProxyScraper integration settings
 PS_SCRAPER_SOURCES = [
     "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all",
@@ -236,6 +242,7 @@ SCRAPERS = {
     "kangproxy": KANGPROXY_INTERVAL,
     "spys": SPYS_INTERVAL,
     "proxybros": PROXYBROS_INTERVAL,
+    "gatherproxy": GATHER_PROXY_INTERVAL,
     "bloody": BLOODY_INTERVAL,
     "proxxy": 300,
 }
@@ -1374,6 +1381,97 @@ async def scrape_proxyhub(interval: float, concurrency: int) -> None:
         await asyncio.sleep(interval)
 
 
+TR_RE = re.compile(
+    r"<td>(.*?)</td>\s*"
+    r"<td><script>document.write\('(.*?)'\)\s*</script></td>\s*"
+    r"<td><script>document.write\(gp.dep\('(.*?)'\)\)\s*</script></td>\s*"
+    r"<td .*?>(.*?)</td>\s*"
+    r"<td>(.*?)</td>\s*"
+    r"<td></td>\s*"
+    r"<td .*?>(.*?)</td>\s*"
+    r"<td .*?>(.*?)</td>",
+    re.S,
+)
+
+PAGE_DIV_RE = re.compile(r'<div class="pagenavi">(.*?)</div>', re.S)
+PAGE_LINK_RE = re.compile(r'<a .*?>(.*?)</a>')
+
+
+def _gp_page_count(text: str) -> int:
+    text = text.replace("\n", " ")
+    count = 0
+    for div in PAGE_DIV_RE.findall(text):
+        for link in PAGE_LINK_RE.findall(div):
+            try:
+                count = int(link)
+            except Exception:
+                pass
+    return count
+
+
+def _parse_gatherproxy(text: str) -> list[tuple[str, str, str, str, int]]:
+    text = text.replace("\n", " ")
+    proxies = []
+    for g in TR_RE.findall(text):
+        try:
+            port = str(int(g[2], 16))
+            resp_time = int(g[6].replace("ms", ""))
+        except Exception:
+            continue
+        proxies.append((g[1], port, g[3], g[4], resp_time))
+    return proxies
+
+
+async def scrape_gatherproxy(interval: float, concurrency: int):
+    sem = asyncio.Semaphore(concurrency)
+    while True:
+        proxies: list[tuple[str, str, str, str, int]] = []
+        async with aiohttp.ClientSession() as session:
+            async def fetch_page(page: int) -> str:
+                async with sem:
+                    resp = await session.post(
+                        GATHER_PROXY_URI,
+                        data={
+                            "Type": "Elite",
+                            "PageIdx": page,
+                            "Uptime": GATHER_PROXY_MIN_UPTIME,
+                        },
+                        timeout=10,
+                    )
+                    return await resp.text()
+
+            try:
+                first = await fetch_page(1)
+            except Exception as e:
+                print(f"gatherproxy page 1 error: {e}", file=sys.stderr)
+                await asyncio.sleep(interval)
+                continue
+
+            proxies.extend(_parse_gatherproxy(first))
+            pages = _gp_page_count(first)
+
+            tasks = [asyncio.create_task(fetch_page(p)) for p in range(2, pages + 1)]
+            for task in asyncio.as_completed(tasks):
+                try:
+                    html = await task
+                except Exception as e:
+                    print(f"gatherproxy fetch error: {e}", file=sys.stderr)
+                    continue
+                proxies.extend(_parse_gatherproxy(html))
+
+        if proxies:
+            with lock:
+                added = False
+                for ip, port, typ, country, rt in proxies:
+                    entry = f"{typ.lower()}:{ip}:{port}"
+                    if entry not in proxy_set:
+                        proxy_set.add(entry)
+                        added = True
+                if added:
+                    write_proxies_to_file()
+        await asyncio.sleep(interval)
+
+
 def main() -> None:
     threads = [
         threading.Thread(target=scrape_mt_proxies, daemon=True),
@@ -1404,6 +1502,12 @@ def main() -> None:
         threading.Thread(
             target=lambda: asyncio.run(
                 scrape_proxyhub(PROXYHUB_INTERVAL, PROXYHUB_CONCURRENCY)
+            ),
+            daemon=True,
+        ),
+        threading.Thread(
+            target=lambda: asyncio.run(
+                scrape_gatherproxy(GATHER_PROXY_INTERVAL, GATHER_PROXY_CONCURRENCY)
             ),
             daemon=True,
         ),

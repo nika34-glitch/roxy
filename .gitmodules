@@ -19,3 +19,6 @@
 [submodule "vendor/gather-proxy-parsing"]
 	path = vendor/gather-proxy-parsing
 	url = https://github.com/veksa/gather-proxy-parsing.git
+[submodule "vendor/Flux"]
+	path = vendor/Flux
+	url = https://github.com/xvertile/Flux.git

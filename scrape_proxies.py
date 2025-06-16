@@ -13,6 +13,7 @@ import json
 import importlib.util
 from pathlib import Path
 from typing import AsyncGenerator, List
+from concurrent.futures import ThreadPoolExecutor
 
 from proxyhub import SOURCE_LIST, fetch_source
 
@@ -132,6 +133,20 @@ GEONODE_URL = (
     "?limit=500&page=4&sort_by=lastChecked&sort_type=desc"
 )
 GEONODE_INTERVAL = 5  # seconds between geonode API requests
+
+# ProxyScraper integration settings
+PS_SCRAPER_SOURCES = [
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=10000&country=all",
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4&timeout=10000",
+    "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks5&timeout=10000",
+    # add any other ProxyScraper endpoints here
+]
+# seconds between each ProxyScraper fetch cycle
+PS_INTERVAL = 30
+# how many sources to fetch in parallel
+PS_CONCURRENT_REQUESTS = 5
+# Increase PS_CONCURRENT_REQUESTS or lower PS_INTERVAL to speed up scraping,
+# or decrease them to reduce load.
 
 # ProxySpace backend configuration
 PROXYSPACE_HTTP_URL = "https://proxyspace.pro/http.txt"
@@ -535,6 +550,48 @@ def scrape_proxyscrape() -> None:
                         added = True
                 if added:
                     write_proxies_to_file()
+        time.sleep(interval)
+
+
+def _ps_get(url: str) -> str:
+    """Helper for ProxyScraper integration to fetch a URL with error logging."""
+    try:
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        return resp.text
+    except Exception as exc:
+        print(f"ProxyScraper source error {url}: {exc}", file=sys.stderr)
+        return ""
+
+
+def scrape_proxyscraper_sources(interval: int = PS_INTERVAL) -> None:
+    """Continuously fetch proxies from ProxyScraper sources."""
+    urls = list(PS_SCRAPER_SOURCES)
+    batch = PS_CONCURRENT_REQUESTS
+    while True:
+        new_entries: list[str] = []
+        for i in range(0, len(urls), batch):
+            subset = urls[i : i + batch]
+            with ThreadPoolExecutor(max_workers=len(subset)) as ex:
+                texts = list(ex.map(_ps_get, subset))
+            for url, text in zip(subset, texts):
+                proto_match = re.search(r"protocol=([^&]+)", url)
+                proto = proto_match.group(1).lower() if proto_match else "http"
+                for line in text.splitlines():
+                    line = line.strip()
+                    if re.match(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$", line):
+                        new_entries.append(f"{proto}:{line}")
+
+        if new_entries:
+            with lock:
+                added = False
+                for p in new_entries:
+                    if p not in proxy_set:
+                        proxy_set.add(p)
+                        added = True
+                if added:
+                    write_proxies_to_file()
+
         time.sleep(interval)
 
 
@@ -1325,6 +1382,7 @@ def main() -> None:
         threading.Thread(target=scrape_tor_relays, daemon=True),
         threading.Thread(target=lambda: asyncio.run(monitor_irc_channels()), daemon=True),
         threading.Thread(target=scrape_proxyscrape, daemon=True),
+        threading.Thread(target=scrape_proxyscraper_sources, daemon=True),
         threading.Thread(target=scrape_gimmeproxy, daemon=True),
         threading.Thread(target=scrape_pubproxy, daemon=True),
         threading.Thread(target=scrape_proxykingdom, daemon=True),

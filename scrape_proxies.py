@@ -385,6 +385,31 @@ async def filter_working(proxies: list[str]) -> list[str]:
     return results
 
 
+async def _filter_p1_batch(proxies: list[str], service: str = "pop3") -> list[str]:
+    """Run ``filter_p1`` on a list of proxies asynchronously."""
+
+    sem = asyncio.Semaphore(POOL_LIMIT)
+
+    def to_url(p: str) -> str:
+        proto, ip, port = p.split(":")
+        return f"{proto}://{ip}:{port}"
+
+    async def check(p: str) -> str | None:
+        async with sem:
+            ok = await asyncio.to_thread(filter_p1, to_url(p), service)
+            return p if ok else None
+
+    tasks = [asyncio.create_task(check(p)) for p in proxies]
+    gathered = await asyncio.gather(*tasks, return_exceptions=True)
+    results: list[str] = []
+    for res in gathered:
+        if isinstance(res, Exception):
+            continue
+        if res:
+            results.append(res)
+    return results
+
+
 async def _filter_chunk(proxies: list[str]) -> list[str]:
     session = await get_aiohttp_session()
     sem = asyncio.Semaphore(POOL_LIMIT)
@@ -547,6 +572,87 @@ def _write_gzip(path: str, items: list[str], mode: str) -> None:
             f.write((line + "\n").encode())
 
 
+def filter_p1(proxy_url: str, service_name: str) -> bool:
+    """Validate TCP and TLS connectivity for a service via optional proxy.
+
+    Parameters
+    ----------
+    proxy_url: str
+        Proxy URL like ``socks5://user:pass@1.2.3.4:1080`` or ``"none"`` for
+        direct connection.
+    service_name: str
+        Currently only ``"pop3"`` is supported.
+
+    Returns
+    -------
+    bool
+        ``True`` on successful TCP and TLS handshake, ``False`` otherwise.
+    """
+
+    if service_name.lower() != "pop3":
+        print(f"Unsupported service: {service_name}")
+        return False
+
+    host, port = "pop.libero.it", 995
+
+    original_socket = socket.socket
+    if proxy_url.lower() != "none":
+        from urllib.parse import urlparse
+        import socks
+
+        parsed = urlparse(proxy_url)
+        scheme = (parsed.scheme or "socks5").lower()
+        proxy_host = parsed.hostname
+        proxy_port = parsed.port
+        username = parsed.username
+        password = parsed.password
+
+        if not proxy_host or not proxy_port:
+            print("Invalid proxy URL")
+            return False
+
+        if scheme.startswith("socks5"):
+            proxy_type = socks.SOCKS5
+        elif scheme.startswith("socks4"):
+            proxy_type = socks.SOCKS4
+        elif scheme in ("http", "https"):
+            proxy_type = socks.HTTP
+        else:
+            print(f"Unsupported proxy scheme: {scheme}")
+            return False
+
+        socks.set_default_proxy(
+            proxy_type, proxy_host, proxy_port, username=username, password=password
+        )
+        socket.socket = socks.socksocket
+
+    try:
+        sock = socket.create_connection((host, port), timeout=10)
+        print("TCP OK")
+    except Exception as exc:
+        print(str(exc))
+        socket.socket = original_socket
+        return False
+
+    try:
+        ctx = ssl.create_default_context()
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        tls_sock = ctx.wrap_socket(sock, server_hostname=host)
+        tls_version = tls_sock.version()
+        cipher = tls_sock.cipher()[0]
+        print(f"TLS OK: {tls_version}, {cipher}")
+        tls_sock.close()
+        result = True
+    except Exception as exc:
+        print(str(exc))
+        result = False
+    finally:
+        socket.socket = original_socket
+
+    return result
+
+
+
 async def get_aiohttp_session() -> aiohttp.ClientSession:
     global aiohttp_session, httpx_client
     if USE_HTTP2:
@@ -609,6 +715,7 @@ async def writer_loop() -> None:
             entries = list(new_entries)
             new_entries.clear()
         entries = await quick_validate(entries)
+        entries = await _filter_p1_batch(entries)
         entries = await filter_working(entries)
         await write_entries(entries)
         if len(proxy_set) > MAX_PROXY_SET_SIZE:
@@ -1717,6 +1824,12 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    import sys
+
+    if len(sys.argv) == 3:
+        success = filter_p1(sys.argv[1], sys.argv[2])
+        sys.exit(0 if success else 1)
+
     try:
         import uvloop
 

@@ -225,6 +225,48 @@ def scrape_mt_proxies(interval: int = MT_INTERVAL) -> None:
         time.sleep(interval)
 
 
+def scrape_freeproxy_world(interval: int = 20) -> None:
+    """Fetch all proxies listed on freeproxy.world."""
+    base_url = "https://www.freeproxy.world/"
+    while True:
+        headers = {"User-Agent": random.choice(USER_AGENTS)}
+        proxies: list[str] = []
+        try:
+            resp = requests.get(base_url, headers=headers, timeout=10)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            count_div = soup.select_one(".proxy_table_pages")
+            total = int(count_div.get("data-counts", "0")) if count_div else 0
+            pages = max(1, (total + 49) // 50)
+            for page in range(1, pages + 1):
+                try:
+                    resp = requests.get(base_url, params={"page": page}, headers=headers, timeout=10)
+                    resp.raise_for_status()
+                    soup = BeautifulSoup(resp.text, "html.parser")
+                    for row in soup.select("tbody tr"):
+                        cols = [td.get_text(strip=True) for td in row.find_all("td")]
+                        if len(cols) >= 6 and cols[0] and cols[1].isdigit():
+                            proto = cols[5].split()[0].lower()
+                            proxies.append(f"{proto}:{cols[0]}:{cols[1]}")
+                except Exception as e:
+                    print(f"Error fetching freeproxy.world page {page}: {e}", file=sys.stderr)
+                    break
+        except Exception as e:
+            print(f"Error fetching freeproxy.world: {e}", file=sys.stderr)
+
+        if proxies:
+            with lock:
+                added = False
+                for p in proxies:
+                    if p not in proxy_set:
+                        proxy_set.add(p)
+                        added = True
+                if added:
+                    write_proxies_to_file()
+
+        time.sleep(interval)
+
+
 def fetch_with_backoff(url: str, max_retries: int = 5) -> str:
     delay = 1
     for _ in range(max_retries):
@@ -952,6 +994,7 @@ def main() -> None:
         threading.Thread(target=scrape_freeproxy, daemon=True),
         threading.Thread(target=scrape_freshproxy, daemon=True),
         threading.Thread(target=scrape_proxifly, daemon=True),
+        threading.Thread(target=scrape_freeproxy_world, daemon=True),
         threading.Thread(target=scrape_freeproxy_all, daemon=True),
         threading.Thread(target=scrape_kangproxy, daemon=True),
     ]

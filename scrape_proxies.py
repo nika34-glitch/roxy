@@ -144,6 +144,18 @@ FRESHPROXY_SOCKS4_URL = "https://vakhov.github.io/fresh-proxy-list/socks4.txt"
 FRESHPROXY_SOCKS5_URL = "https://vakhov.github.io/fresh-proxy-list/socks5.txt"
 FRESHPROXY_INTERVAL = 300  # fetch every 5 minutes
 
+# Proxifly GitHub proxy lists
+PROXIFLY_HTTP_URL = (
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt"
+)
+PROXIFLY_SOCKS4_URL = (
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks4/data.txt"
+)
+PROXIFLY_SOCKS5_URL = (
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt"
+)
+PROXIFLY_INTERVAL = 300  # fetch every 5 minutes
+
 # Free proxy list websites
 PROXY_LIST_SITES = [
     ("https://free-proxy-list.net/", "http"),
@@ -578,6 +590,40 @@ def scrape_freshproxy(interval: int = FRESHPROXY_INTERVAL) -> None:
         time.sleep(interval)
 
 
+def scrape_proxifly(interval: int = PROXIFLY_INTERVAL) -> None:
+    """Fetch proxies from the Proxifly free-proxy lists."""
+    urls = [
+        (PROXIFLY_HTTP_URL, "http"),
+        (PROXIFLY_SOCKS4_URL, "socks4"),
+        (PROXIFLY_SOCKS5_URL, "socks5"),
+    ]
+    while True:
+        proxies = []
+        for url, proto in urls:
+            try:
+                resp = requests.get(url, timeout=10)
+                resp.raise_for_status()
+                for line in resp.text.splitlines():
+                    line = line.strip()
+                    if line:
+                        if '://' in line:
+                            _, line = line.split('://', 1)
+                        proxies.append(f"{proto}:{line}")
+            except Exception as e:
+                print(f"Error fetching {url}: {e}", file=sys.stderr)
+            time.sleep(1)
+        if proxies:
+            with lock:
+                added = False
+                for p in proxies:
+                    if p not in proxy_set:
+                        proxy_set.add(p)
+                        added = True
+                if added:
+                    write_proxies_to_file()
+        time.sleep(interval)
+
+
 async def _irc_listener(server: str, port: int = 6667) -> None:
     """Connect to an IRC server and monitor channels for proxy announcements."""
     import string
@@ -830,6 +876,7 @@ def main() -> None:
         threading.Thread(target=scrape_proxy_list_download, daemon=True),
         threading.Thread(target=scrape_freeproxy, daemon=True),
         threading.Thread(target=scrape_freshproxy, daemon=True),
+        threading.Thread(target=scrape_proxifly, daemon=True),
     ]
     for t in threads:
         t.start()

@@ -9,11 +9,17 @@ import asyncio
 import os
 import socket
 import struct
+import json
+from typing import AsyncGenerator, List
+
+import aiohttp
 from bs4 import BeautifulSoup
 
 MTPROTO_URL = "https://mtpro.xyz/api/?type=mtproto"
 SOCKS_URL = "https://mtpro.xyz/api/?type=socks"
 OUTPUT_FILE = "proxies.txt"
+
+PROXXY_SOURCES_FILE = os.path.join(os.path.dirname(__file__), "vendor", "proXXy", "proxy_sources.json")
 
 MT_INTERVAL = 1  # seconds between mtpro.xyz polls
 PASTE_INTERVAL = 60  # seconds between paste feed checks
@@ -185,6 +191,30 @@ SPYS_INTERVAL = 300  # fetch every 5 minutes
 PROXYBROS_URL = "https://proxybros.com/free-proxy-list/"
 PROXYBROS_INTERVAL = 600  # fetch every 10 minutes
 
+SCRAPERS = {
+    "mtpro": MT_INTERVAL,
+    "paste": PASTE_INTERVAL,
+    "freeproxy_world": 20,
+    "free_proxy_cz": 20,
+    "tor": TOR_INTERVAL,
+    "proxyscrape": API_INTERVAL,
+    "gimmeproxy": API_INTERVAL,
+    "pubproxy": API_INTERVAL,
+    "proxykingdom": API_INTERVAL,
+    "geonode": GEONODE_INTERVAL,
+    "proxyspace": PROXYSPACE_INTERVAL,
+    "proxy_list_sites": PROXY_LIST_INTERVAL,
+    "proxy_list_download": API_INTERVAL,
+    "freeproxy": FREEPROXY_INTERVAL,
+    "freshproxy": FRESHPROXY_INTERVAL,
+    "proxifly": PROXIFLY_INTERVAL,
+    "freeproxy_all": FREEPROXY_ALL_INTERVAL,
+    "kangproxy": KANGPROXY_INTERVAL,
+    "spys": SPYS_INTERVAL,
+    "proxybros": PROXYBROS_INTERVAL,
+    "proxxy": 300,
+}
+
 proxy_set = set()
 lock = threading.Lock()
 
@@ -201,7 +231,42 @@ def fetch_json(url):
     return response.json()
 
 
-def scrape_mt_proxies(interval: int = MT_INTERVAL) -> None:
+async def fetch_proxxy_sources() -> AsyncGenerator[List[str], None]:
+    """Fetch all proxy sources defined by the proXXy project."""
+    try:
+        with open(PROXXY_SOURCES_FILE, "r") as f:
+            sources = json.load(f)
+    except Exception as exc:
+        print(f"Error loading {PROXXY_SOURCES_FILE}: {exc}", file=sys.stderr)
+        return
+
+    urls = []
+    for url_list in sources.values():
+        urls.extend(url_list)
+
+    async with aiohttp.ClientSession() as session:
+        tasks = {asyncio.create_task(session.get(url, timeout=10)): url for url in urls}
+        batch: List[str] = []
+        for task in asyncio.as_completed(tasks):
+            url = tasks[task]
+            try:
+                resp = await task
+                text = await resp.text()
+                for line in text.splitlines():
+                    line = line.strip()
+                    if re.match(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$", line):
+                        batch.append(line)
+                        if len(batch) >= 1000:
+                            yield batch
+                            batch = []
+            except Exception as e:
+                print(f"proXXy source error {url}: {e}", file=sys.stderr)
+        if batch:
+            yield batch
+
+
+def scrape_mt_proxies() -> None:
+    interval = SCRAPERS["mtpro"]
     while True:
         proxies = []
         try:
@@ -235,7 +300,8 @@ def scrape_mt_proxies(interval: int = MT_INTERVAL) -> None:
         time.sleep(interval)
 
 
-def scrape_freeproxy_world(interval: int = 20) -> None:
+def scrape_freeproxy_world() -> None:
+    interval = SCRAPERS["freeproxy_world"]
     """Fetch all proxies listed on freeproxy.world."""
     base_url = "https://www.freeproxy.world/"
     while True:
@@ -301,7 +367,8 @@ def _parse_free_proxy_cz_page(soup: BeautifulSoup) -> list[str]:
     return proxies
 
 
-def scrape_free_proxy_cz(interval: int = 20) -> None:
+def scrape_free_proxy_cz() -> None:
+    interval = SCRAPERS["free_proxy_cz"]
     """Fetch proxies from http://free-proxy.cz/en/ across all pages."""
     base_url = "http://free-proxy.cz"
     while True:
@@ -376,7 +443,8 @@ def extract_proxies(text: str) -> list[str]:
     return found
 
 
-def monitor_paste_feeds(interval: int = PASTE_INTERVAL) -> None:
+def monitor_paste_feeds() -> None:
+    interval = SCRAPERS["paste"]
     while True:
         for feed in PASTE_FEEDS:
             text = fetch_with_backoff(feed)
@@ -394,7 +462,8 @@ def monitor_paste_feeds(interval: int = PASTE_INTERVAL) -> None:
         time.sleep(interval)
 
 
-def scrape_tor_relays(interval: int = TOR_INTERVAL) -> None:
+def scrape_tor_relays() -> None:
+    interval = SCRAPERS["tor"]
     """Fetch relay descriptors from Onionoo and record their addresses."""
     while True:
         try:
@@ -427,7 +496,8 @@ def scrape_tor_relays(interval: int = TOR_INTERVAL) -> None:
         time.sleep(interval)
 
 
-def scrape_proxyscrape(interval: float = API_INTERVAL) -> None:
+def scrape_proxyscrape() -> None:
+    interval = SCRAPERS["proxyscrape"]
     urls = [
         (PROXYSCRAPE_HTTP_URL, "http"),
         (PROXYSCRAPE_SOCKS4_URL, "socks4"),
@@ -458,7 +528,8 @@ def scrape_proxyscrape(interval: float = API_INTERVAL) -> None:
         time.sleep(interval)
 
 
-def scrape_gimmeproxy(interval: float = API_INTERVAL) -> None:
+def scrape_gimmeproxy() -> None:
+    interval = SCRAPERS["gimmeproxy"]
     while True:
         try:
             resp = requests.get(GIMMEPROXY_URL, timeout=10)
@@ -478,7 +549,8 @@ def scrape_gimmeproxy(interval: float = API_INTERVAL) -> None:
         time.sleep(interval)
 
 
-def scrape_pubproxy(interval: float = API_INTERVAL) -> None:
+def scrape_pubproxy() -> None:
+    interval = SCRAPERS["pubproxy"]
     while True:
         try:
             resp = requests.get(PUBPROXY_URL, timeout=10)
@@ -505,7 +577,8 @@ def scrape_pubproxy(interval: float = API_INTERVAL) -> None:
         time.sleep(interval)
 
 
-def scrape_proxykingdom(interval: float = API_INTERVAL) -> None:
+def scrape_proxykingdom() -> None:
+    interval = SCRAPERS["proxykingdom"]
     while True:
         try:
             resp = requests.get(PROXYKINGDOM_URL, timeout=10)
@@ -525,7 +598,8 @@ def scrape_proxykingdom(interval: float = API_INTERVAL) -> None:
         time.sleep(interval)
 
 
-def scrape_geonode(interval: int = GEONODE_INTERVAL) -> None:
+def scrape_geonode() -> None:
+    interval = SCRAPERS["geonode"]
     """Fetch proxies from the geonode API."""
     while True:
         proxies = []
@@ -553,7 +627,8 @@ def scrape_geonode(interval: int = GEONODE_INTERVAL) -> None:
         time.sleep(interval)
 
 
-def scrape_proxyspace(interval: int = PROXYSPACE_INTERVAL) -> None:
+def scrape_proxyspace() -> None:
+    interval = SCRAPERS["proxyspace"]
     """Fetch proxies from proxyspace.pro lists."""
     urls = [
         (PROXYSPACE_HTTP_URL, "http"),
@@ -586,7 +661,8 @@ def scrape_proxyspace(interval: int = PROXYSPACE_INTERVAL) -> None:
         time.sleep(interval)
 
 
-def scrape_proxy_list_sites(interval: int = PROXY_LIST_INTERVAL) -> None:
+def scrape_proxy_list_sites() -> None:
+    interval = SCRAPERS["proxy_list_sites"]
     """Fetch proxies from free-proxy-list.net and similar sites."""
     while True:
         for url, proto in PROXY_LIST_SITES:
@@ -625,7 +701,8 @@ def scrape_proxy_list_sites(interval: int = PROXY_LIST_INTERVAL) -> None:
         time.sleep(interval)
 
 
-def scrape_proxy_list_download(interval: float = API_INTERVAL) -> None:
+def scrape_proxy_list_download() -> None:
+    interval = SCRAPERS["proxy_list_download"]
     """Fetch proxies from https://www.proxy-list.download/api."""
     types = ["http", "https", "socks4", "socks5"]
     while True:
@@ -654,7 +731,8 @@ def scrape_proxy_list_download(interval: float = API_INTERVAL) -> None:
         time.sleep(interval)
 
 
-def scrape_freeproxy(interval: int = FREEPROXY_INTERVAL) -> None:
+def scrape_freeproxy() -> None:
+    interval = SCRAPERS["freeproxy"]
     """Fetch proxies from dpangestuw Free-Proxy GitHub lists."""
     urls = [
         (FREEPROXY_HTTP_URL, "http"),
@@ -686,7 +764,8 @@ def scrape_freeproxy(interval: int = FREEPROXY_INTERVAL) -> None:
         time.sleep(interval)
 
 
-def scrape_freshproxy(interval: int = FRESHPROXY_INTERVAL) -> None:
+def scrape_freshproxy() -> None:
+    interval = SCRAPERS["freshproxy"]
     """Fetch proxies from the Fresh Proxy List project."""
     urls = [
         (FRESHPROXY_HTTP_URL, "http"),
@@ -719,7 +798,8 @@ def scrape_freshproxy(interval: int = FRESHPROXY_INTERVAL) -> None:
         time.sleep(interval)
 
 
-def scrape_proxifly(interval: int = PROXIFLY_INTERVAL) -> None:
+def scrape_proxifly() -> None:
+    interval = SCRAPERS["proxifly"]
     """Fetch proxies from the Proxifly free-proxy lists."""
     urls = [
         (PROXIFLY_HTTP_URL, "http"),
@@ -753,7 +833,8 @@ def scrape_proxifly(interval: int = PROXIFLY_INTERVAL) -> None:
         time.sleep(interval)
 
 
-def scrape_freeproxy_all(interval: int = FREEPROXY_ALL_INTERVAL) -> None:
+def scrape_freeproxy_all() -> None:
+    interval = SCRAPERS["freeproxy_all"]
     """Fetch aggregated proxies from dpangestuw Free-Proxy."""
     while True:
         proxies = []
@@ -784,7 +865,8 @@ def scrape_freeproxy_all(interval: int = FREEPROXY_ALL_INTERVAL) -> None:
         time.sleep(interval)
 
 
-def scrape_kangproxy(interval: int = KANGPROXY_INTERVAL) -> None:
+def scrape_kangproxy() -> None:
+    interval = SCRAPERS["kangproxy"]
     """Fetch proxies from the KangProxy raw lists."""
     urls = [KANGPROXY_OLD_URL, KANGPROXY_URL]
     while True:
@@ -835,7 +917,8 @@ def _parse_spys_list(text: str) -> list[tuple[str, str]]:
     return proxies
 
 
-def scrape_spys(interval: int = SPYS_INTERVAL) -> None:
+def scrape_spys() -> None:
+    interval = SCRAPERS["spys"]
     """Fetch proxies from spys.me lists and store as type;ip;port."""
     urls = [
         (SPYS_HTTP_URL, "http"),
@@ -866,7 +949,8 @@ def scrape_spys(interval: int = SPYS_INTERVAL) -> None:
         time.sleep(interval)
 
 
-def scrape_proxybros(interval: int = PROXYBROS_INTERVAL) -> None:
+def scrape_proxybros() -> None:
+    interval = SCRAPERS["proxybros"]
     """Fetch proxies from proxybros.com free proxy list."""
     while True:
         proxies = []
@@ -1134,6 +1218,24 @@ async def crawl_dht() -> None:
     await asyncio.gather(*workers)
 
 
+async def run_proxxy() -> None:
+    """Background task running the proXXy asynchronous scraper."""
+    interval = SCRAPERS["proxxy"]
+    while True:
+        async for batch in fetch_proxxy_sources():
+            if not batch:
+                continue
+            with lock:
+                added = False
+                for p in batch:
+                    if p not in proxy_set:
+                        proxy_set.add(p)
+                        added = True
+                if added:
+                    write_proxies_to_file()
+        await asyncio.sleep(interval)
+
+
 def main() -> None:
     threads = [
         threading.Thread(target=scrape_mt_proxies, daemon=True),
@@ -1158,6 +1260,7 @@ def main() -> None:
         threading.Thread(target=scrape_kangproxy, daemon=True),
         threading.Thread(target=scrape_spys, daemon=True),
         threading.Thread(target=scrape_proxybros, daemon=True),
+        threading.Thread(target=lambda: asyncio.run(run_proxxy()), daemon=True),
     ]
     for t in threads:
         t.start()

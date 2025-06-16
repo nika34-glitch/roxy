@@ -18,3 +18,4 @@ The script continuously fetches the latest proxies from `https://mtpro.xyz/api/?
 The APIs polled include ProxyScrape, ProxyKingdom, GimmeProxy, PubProxy and ProxySpace. Proxy lists are also fetched from `free-proxy-list.net`, `us-proxy.org`, `sslproxies.org` and `socks-proxy.net` approximately every 10 minutes. ProxySpace endpoints are queried every 20 minutes.
 The scraper additionally polls the HTTP, SOCKS4 and SOCKS5 lists from the `Free-Proxy` GitHub project every two minutes. Its aggregated `All_proxies.txt` feed is fetched every five minutes, and the Fresh Proxy List project at `vakhov.github.io` is queried every five minutes to keep the pool up to date. The KangProxy raw lists are checked about every four hours.
 The Proxifly free-proxy lists are also checked every five minutes.
+Proxies from spys.me are downloaded every five minutes from `https://spys.me/proxy.txt` and `https://spys.me/socks.txt`.

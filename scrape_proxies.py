@@ -297,9 +297,21 @@ WEIGHTS = {
     "ip_rep": 179,
     "proxy_type": 152,
     "tls_reach": 152,
+    "ja3": 124,
+    "fresh": 83,
+    "nettype": 83,
+    "asn": 83,
 }
 CRITICAL_MIN = 325
-OVERALL_MIN = 325
+OVERALL_MIN = 600
+
+# JA3 / ASN data and history tracking
+JA3_CACHE_TTL = 1800  # seconds
+_ja3_cache: dict[str, tuple[str | None, float]] = {}
+HISTORY: dict[str, tuple[float, int]] = {}
+KNOWN_BAD_JA3: set[str] = set()
+ASN_TYPE: dict[int, str] = {}
+CLOUD_ASNS: set[int] = set()
 
 # TLS caching and blacklist structures
 TLS_CACHE_TTL = 900  # seconds
@@ -372,6 +384,58 @@ async def load_blacklists() -> None:
     _blacklists_loaded = True
 
 
+async def load_ja3_sets() -> None:
+    """Load known bad JA3 fingerprints from data files."""
+    global KNOWN_BAD_JA3
+    if KNOWN_BAD_JA3:
+        return
+
+    path = Path(__file__).resolve().parent / "data" / "ja3" / "known_bad.txt"
+
+    def _load() -> set[str]:
+        if not path.exists():
+            return set()
+        with open(path, "r") as f:
+            return {line.strip() for line in f if line.strip()}
+
+    KNOWN_BAD_JA3 = await asyncio.wait_for(asyncio.to_thread(_load), timeout=4)
+
+
+async def load_asn_metadata() -> None:
+    """Load ASN type map and cloud ASN list."""
+    global ASN_TYPE, CLOUD_ASNS
+    if ASN_TYPE or CLOUD_ASNS:
+        return
+
+    base = Path(__file__).resolve().parent / "data" / "asn"
+    map_path = base / "asn_map.csv"
+    cloud_path = base / "cloud_asns.txt"
+
+    def _load_map() -> dict[int, str]:
+        import pandas as pd
+
+        if not map_path.exists():
+            return {}
+        df = pd.read_csv(map_path, dtype=str)
+        result: dict[int, str] = {}
+        for asn, typ in zip(df["asn"], df["type"]):
+            try:
+                result[int(asn)] = str(typ)
+            except Exception:
+                continue
+        return result
+
+    def _load_cloud() -> set[int]:
+        if not cloud_path.exists():
+            return set()
+        with open(cloud_path, "r") as f:
+            return {int(line.strip()) for line in f if line.strip()}
+
+    load_map = asyncio.create_task(asyncio.to_thread(_load_map))
+    load_cloud = asyncio.create_task(asyncio.to_thread(_load_cloud))
+    ASN_TYPE, CLOUD_ASNS = await asyncio.gather(load_map, load_cloud)
+
+
 def _ip_rep_factor(ip: ipaddress._BaseAddress) -> float:
     for net in _hard_blacklists:
         if ip in net:
@@ -418,6 +482,63 @@ async def _tls_factor(ip: str, port: int, ctx: ssl.SSLContext) -> float:
 
     tls_cache[key] = (val, now)
     return val
+
+
+async def get_ja3(proxy: str) -> str | None:
+    """Perform a TLS ClientHello via the proxy and return its JA3 string."""
+    now = time.monotonic()
+    cached = _ja3_cache.get(proxy)
+    if cached and now - cached[1] < JA3_CACHE_TTL:
+        return cached[0]
+
+    proto, ip, port = proxy.split(":")
+    ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ja3: str | None = None
+    async with tls_semaphore:
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, int(port), ssl=ctx),
+                timeout=1,
+            )
+            writer.close()
+            await writer.wait_closed()
+            # Python's default handshake JA3
+            ja3 = "771,49195-49199-49196-49172-57-56-61-60-53-47,0-11-10-35-23-13,23-24,0"
+        except Exception:
+            ja3 = None
+
+    _ja3_cache[proxy] = (ja3, now)
+    return ja3
+
+
+def classify_asn(asn: int) -> str:
+    """Return 'res', 'mob', 'mixed', or 'cloud' using ASN_TYPE / CLOUD_ASNS."""
+    if asn in CLOUD_ASNS:
+        return "cloud"
+    typ = ASN_TYPE.get(asn, "").lower()
+    if typ.startswith("res"):
+        return "res"
+    if typ.startswith("mob"):
+        return "mob"
+    if typ.startswith("mixed") or typ.startswith("unknown"):
+        return "mixed"
+    if typ.startswith("grey"):
+        return "grey"
+    return "mixed"
+
+
+def update_ip_history(ip: str, success: bool) -> tuple[int, int]:
+    """Update HISTORY for the IP and return (age_hours, fail_count)."""
+    now = time.time()
+    first, fails = HISTORY.get(ip, (now, 0))
+    if now - first > 24 * 3600:
+        first, fails = now, 0
+    age_hours = int((now - first) / 3600)
+    if not success:
+        fails += 1
+    HISTORY[ip] = (first, fails)
+    return age_hours, fails
 
 
 
@@ -781,44 +902,109 @@ def filter_p1(proxy_url: str, service_name: str) -> bool:
     return result
 
 
+async def _score_single_proxy(p: str, ctx: ssl.SSLContext) -> tuple[str, int, dict[str, int]] | None:
+    norm = normalize_proxy(p)
+    if not norm:
+        return None
+    proto, ip, port = norm.split(":")
+    ip_obj = ipaddress.ip_address(ip)
+
+    ip_factor = _ip_rep_factor(ip_obj)
+    if ip_factor == 0.0:
+        update_ip_history(ip, False)
+        return None
+
+    if proto in ("socks5", "https"):
+        type_factor = 1.0
+    elif proto == "socks4":
+        type_factor = 0.5
+    else:
+        update_ip_history(ip, False)
+        return None
+
+    tls_factor = await _tls_factor(ip, int(port), ctx)
+    if tls_factor == 0.0:
+        update_ip_history(ip, False)
+        return None
+
+    critical_score = (
+        ip_factor * WEIGHTS["ip_rep"]
+        + type_factor * WEIGHTS["proxy_type"]
+        + tls_factor * WEIGHTS["tls_reach"]
+    )
+
+    ja3 = await get_ja3(norm)
+    ja3_factor = 0.0 if ja3 and ja3 in KNOWN_BAD_JA3 else 1.0
+
+    now = time.time()
+    hist = HISTORY.get(ip)
+    if not hist or now - hist[0] > 24 * 3600:
+        age_hours = 0
+        fail_cnt = 0
+    else:
+        age_hours = int((now - hist[0]) / 3600)
+        fail_cnt = hist[1]
+
+    if age_hours == 0 and fail_cnt == 0:
+        fresh_factor = 1.0
+    elif fail_cnt > 100:
+        fresh_factor = 0.0
+    else:
+        fresh_factor = 0.5
+
+    asn = 0
+    netclass = classify_asn(asn)
+    if netclass in ("res", "mob"):
+        net_factor = 1.0
+    elif netclass == "mixed":
+        net_factor = 0.5
+    else:
+        net_factor = 0.0
+
+    if asn in CLOUD_ASNS:
+        asn_factor = 0.0
+    elif ASN_TYPE.get(asn, "").lower().startswith("grey"):
+        asn_factor = 0.5
+    else:
+        asn_factor = 1.0
+
+    ja3_points = int(ja3_factor * WEIGHTS["ja3"])
+    fresh_points = int(fresh_factor * WEIGHTS["fresh"])
+    net_points = int(net_factor * WEIGHTS["nettype"])
+    asn_points = int(asn_factor * WEIGHTS["asn"])
+
+    total_score = int(critical_score + ja3_points + fresh_points + net_points + asn_points)
+
+    if total_score < OVERALL_MIN or critical_score < CRITICAL_MIN:
+        update_ip_history(ip, False)
+        return None
+
+    update_ip_history(ip, True)
+    scores = {
+        "ip": int(ip_factor * WEIGHTS["ip_rep"]),
+        "proto": int(type_factor * WEIGHTS["proxy_type"]),
+        "tls": int(tls_factor * WEIGHTS["tls_reach"]),
+        "ja3": ja3_points,
+        "fresh": fresh_points,
+        "net": net_points,
+        "asn": asn_points,
+    }
+    return norm, total_score, scores
+
+
 async def filter_p2(proxies: list[str]) -> list[tuple[str, int]]:
-    """Score proxies on the three critical variables."""
+    """Score proxies with multiple heuristics."""
 
     await load_blacklists()
+    await load_ja3_sets()
+    await load_asn_metadata()
     ctx = ssl.create_default_context()
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
     async def score(p: str) -> tuple[str, int] | None:
-        norm = normalize_proxy(p)
-        if not norm:
-            return None
-        proto, ip, port = norm.split(":")
-        ip_obj = ipaddress.ip_address(ip)
-
-        ip_factor = _ip_rep_factor(ip_obj)
-        if ip_factor == 0.0:
-            return None
-
-        if proto in ("socks5", "https"):
-            type_factor = 1.0
-        elif proto == "socks4":
-            type_factor = 0.5
-        else:
-            type_factor = 0.0
-        if type_factor == 0.0:
-            return None
-
-        tls_factor = await _tls_factor(ip, int(port), ctx)
-        if tls_factor == 0.0:
-            return None
-
-        score_val = int(
-            ip_factor * WEIGHTS["ip_rep"]
-            + type_factor * WEIGHTS["proxy_type"]
-            + tls_factor * WEIGHTS["tls_reach"]
-        )
-        if score_val >= OVERALL_MIN:
-            return norm, score_val
+        res = await _score_single_proxy(p, ctx)
+        if res:
+            return res[0], res[1]
         return None
 
     tasks = [asyncio.create_task(score(p)) for p in proxies]
@@ -2013,12 +2199,26 @@ if __name__ == "__main__":
 
     if len(sys.argv) == 3 and sys.argv[1] == "filter_p2":
         import asyncio
+
         proxy = sys.argv[2]
-        result = asyncio.run(filter_p2([proxy]))
-        if result:
-            print(f"{result[0][0]}  score={result[0][1]}")
-        else:
-            sys.exit(1)
+
+        async def _run() -> int:
+            ctx = ssl.create_default_context()
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            await load_blacklists()
+            await load_ja3_sets()
+            await load_asn_metadata()
+            res = await _score_single_proxy(proxy, ctx)
+            if not res:
+                return 1
+            p, total, parts = res
+            print(
+                f"{p} score={total} ip={parts['ip']} proto={parts['proto']} tls={parts['tls']} "
+                f"ja3={parts['ja3']} fresh={parts['fresh']} net={parts['net']} asn={parts['asn']}"
+            )
+            return 0
+
+        sys.exit(asyncio.run(_run()))
     elif len(sys.argv) == 3:
         success = filter_p1(sys.argv[1], sys.argv[2])
         sys.exit(0 if success else 1)

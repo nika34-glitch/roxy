@@ -5,11 +5,19 @@ import random
 import re
 import base64
 import asyncio
-try:
-    import uvloop
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-except Exception:
+import sys
+
+if sys.platform != "win32":
+    try:
+        import uvloop
+    except Exception:
+        uvloop = None
+    else:
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+else:
     uvloop = None
+    if hasattr(asyncio, "WindowsSelectorEventLoopPolicy"):
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 from functools import lru_cache
 import os
 import socket

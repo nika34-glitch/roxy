@@ -5,6 +5,8 @@ import random
 import re
 import base64
 import asyncio
+import uvloop
+asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
 import os
 import socket
 import struct
@@ -14,6 +16,7 @@ import importlib.util
 from pathlib import Path
 from typing import AsyncGenerator, List
 from concurrent.futures import ThreadPoolExecutor
+import multiprocessing
 import gzip
 import orjson
 import regex
@@ -21,9 +24,15 @@ import logging
 import ipaddress
 import itertools
 import aiofiles
+import aiodns
 import csv
 import bisect
 from collections import defaultdict
+from pybloom_live import ScalableBloomFilter
+try:
+    from score_cython import score_single_proxy as cy_score_single_proxy
+except Exception:
+    cy_score_single_proxy = None
 
 from proxyhub import SOURCE_LIST, fetch_source
 
@@ -136,6 +145,7 @@ BOOTSTRAP_NODES = [
 ]
 MAX_DHT_CONCURRENCY = int(os.getenv("MAX_DHT_CONCURRENCY", "200"))
 MAX_DHT_WORKERS = int(os.getenv("MAX_DHT_WORKERS", "40"))
+DHT_PROCESSES = int(os.getenv("DHT_PROCESSES", "1"))
 PROXY_PORTS = {8080, 3128, 1080, 9050, 8000, 8081, 8888}
 DHT_LOG_EVERY = 100  # log progress every N visited nodes
 
@@ -287,7 +297,9 @@ httpx_client = None
 USE_HTTP2 = os.getenv("USE_HTTP2", "0") == "1"
 MAIN_LOOP: asyncio.AbstractEventLoop | None = None
 
-proxy_set: set[str] = set()
+proxy_set: ScalableBloomFilter = ScalableBloomFilter(mode=ScalableBloomFilter.SMALL_SET_GROWTH)
+DNS_RESOLVER = aiodns.DNSResolver()
+SOURCE_BACKOFF: defaultdict[str, int] = defaultdict(int)
 proxy_lock = asyncio.Lock()
 new_entries: asyncio.Queue[str] = asyncio.Queue()
 write_event = asyncio.Event()
@@ -781,8 +793,11 @@ async def _filter_p1_batch(proxies: list[str], service: str = "pop3") -> list[st
         return f"{proto}://{ip}:{port}"
 
     async def check(p: str) -> str | None:
+        loop = asyncio.get_running_loop()
         async with sem:
-            ok = await asyncio.to_thread(filter_p1, to_url(p), service)
+            ok = await loop.run_in_executor(
+                SHARED_THREAD_POOL, filter_p1, to_url(p), service
+            )
             return p if ok else None
 
     tasks = [asyncio.create_task(check(p)) for p in proxies]
@@ -904,9 +919,21 @@ async def quick_validate(proxies: list[str]) -> list[str]:
     """Check that proxy ports are reachable."""
     sem = asyncio.Semaphore(POOL_LIMIT)
 
+    async def resolve(host: str) -> str | None:
+        if host.replace(".", "").isdigit():
+            return host
+        try:
+            resp = await DNS_RESOLVER.gethostbyname(host, socket.AF_INET)
+            return resp.addresses[0]
+        except Exception:
+            return None
+
     async def check(p: str) -> str | None:
         try:
-            _, ip, port = p.split(":")
+            _, host, port = p.split(":")
+            ip = await resolve(host)
+            if not ip:
+                return None
             async with sem:
                 reader, writer = await asyncio.wait_for(
                     asyncio.open_connection(ip, int(port)),
@@ -917,7 +944,7 @@ async def quick_validate(proxies: list[str]) -> list[str]:
             record_attempt(ip, True)
             return p
         except Exception:
-            record_attempt(p.split(":")[1], False)
+            record_attempt(host, False)
             return None
 
     tasks = [asyncio.create_task(check(p)) for p in proxies]
@@ -953,14 +980,35 @@ async def write_entries(entries: list[str]) -> None:
             await asyncio.to_thread(_write_gzip, path, items, mode)
         else:
             async with aiofiles.open(path, mode) as f:
+                buf: list[str] = []
+                size = 0
                 for line in items:
-                    await f.write(line + "\n")
+                    line = line + "\n"
+                    buf.append(line)
+                    size += len(line)
+                    if size >= 65536:
+                        await f.writelines(buf)
+                        await f.flush()
+                        buf = []
+                        size = 0
+                if buf:
+                    await f.writelines(buf)
 
 
 def _write_gzip(path: str, items: list[str], mode: str) -> None:
     with gzip.open(path, mode) as f:
+        buf: list[str] = []
+        size = 0
         for line in items:
-            f.write((line + "\n").encode())
+            line = line + "\n"
+            buf.append(line)
+            size += len(line)
+            if size >= 65536:
+                f.write("".join(buf).encode())
+                buf = []
+                size = 0
+        if buf:
+            f.write("".join(buf).encode())
 
 
 def filter_p1(proxy_url: str, service_name: str) -> bool:
@@ -1044,6 +1092,8 @@ def filter_p1(proxy_url: str, service_name: str) -> bool:
 
 
 async def _score_single_proxy(p: str, ctx: ssl.SSLContext) -> tuple[str, int, dict[str, int]] | None:
+    if cy_score_single_proxy is not None:
+        return cy_score_single_proxy(p)
     norm = normalize_proxy(p)
     if not norm:
         return None
@@ -1260,6 +1310,7 @@ def add_proxies_sync(proxies: List[str]) -> None:
 
 
 async def writer_loop() -> None:
+    global proxy_set
     while True:
         await write_event.wait()
         write_event.clear()
@@ -1280,7 +1331,7 @@ async def writer_loop() -> None:
         await write_entries(to_save)
         if len(proxy_set) > MAX_PROXY_SET_SIZE:
             logging.info("Flushing proxy set to limit memory usage")
-            proxy_set.clear()
+            proxy_set = ScalableBloomFilter(mode=ScalableBloomFilter.SMALL_SET_GROWTH)
 
 
 async def fetch_json(url: str) -> dict:
@@ -1452,9 +1503,17 @@ async def fetch_with_backoff(url: str, max_retries: int = 5) -> str:
                 and not isinstance(session, aiohttp.ClientSession)
             ):
                 resp = await session.get(url, headers=headers)
+                if resp.status == 429:
+                    SOURCE_BACKOFF[url] = min(SOURCE_BACKOFF[url] + 1, 3)
+                else:
+                    SOURCE_BACKOFF[url] = max(SOURCE_BACKOFF[url] - 1, 0)
                 resp.raise_for_status()
                 return resp.text
             async with session.get(url, headers=headers, timeout=REQUEST_TIMEOUT) as resp:
+                if resp.status == 429:
+                    SOURCE_BACKOFF[url] = min(SOURCE_BACKOFF[url] + 1, 3)
+                else:
+                    SOURCE_BACKOFF[url] = max(SOURCE_BACKOFF[url] - 1, 0)
                 if resp.status >= 400:
                     raise aiohttp.ClientResponseError(
                         resp.request_info, resp.history, status=resp.status
@@ -1469,7 +1528,7 @@ async def fetch_with_backoff(url: str, max_retries: int = 5) -> str:
 
 def extract_proxies(text: str) -> list[str]:
     found = []
-    for m in PROXY_RE.finditer(text):
+    for m in PROXY_RE.finditer(text, overlapped=True):
         ip = m.group(1)
         port = int(m.group(2))
         if not (1 <= port <= 65535):
@@ -2155,7 +2214,7 @@ async def crawl_dht() -> None:
     loop = asyncio.get_running_loop()
     node_id = os.urandom(20)
     transport, client = await loop.create_datagram_endpoint(
-        lambda: DHTClient(node_id), local_addr=("0.0.0.0", 0)
+        lambda: DHTClient(node_id), local_addr=("0.0.0.0", 0), reuse_port=True
     )
 
     queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
@@ -2220,6 +2279,15 @@ async def crawl_dht() -> None:
 
     workers = [asyncio.create_task(worker()) for _ in range(MAX_DHT_WORKERS)]
     await asyncio.gather(*workers)
+
+
+def spawn_dht_processes() -> list[multiprocessing.Process]:
+    procs = []
+    for _ in range(DHT_PROCESSES):
+        p = multiprocessing.Process(target=lambda: asyncio.run(crawl_dht()))
+        p.start()
+        procs.append(p)
+    return procs
 
 
 async def run_proxxy() -> None:
@@ -2365,55 +2433,49 @@ async def scrape_gatherproxy(interval: float, concurrency: int):
         await asyncio.sleep(interval)
 
 
-async def run_periodic(func, interval: float) -> None:
+async def run_periodic(func, interval: float, key: str | None = None) -> None:
     while True:
         await func()
-        await asyncio.sleep(interval)
+        delay = interval
+        if key is not None:
+            delay *= 2 ** SOURCE_BACKOFF[key]
+        await asyncio.sleep(delay)
 
 
 async def main() -> None:
     global MAIN_LOOP
     MAIN_LOOP = asyncio.get_running_loop()
     await load_blacklists()
-    tasks = [
-        asyncio.create_task(run_periodic(scrape_mt_proxies, SCRAPERS["mtpro"])),
-        asyncio.create_task(run_periodic(monitor_paste_feeds, SCRAPERS["paste"])),
-        asyncio.create_task(crawl_dht()),
-        asyncio.create_task(run_periodic(scrape_tor_relays, SCRAPERS["tor"])),
-        asyncio.create_task(monitor_irc_channels()),
-        asyncio.create_task(run_periodic(scrape_proxyscrape, SCRAPERS["proxyscrape"])),
-        asyncio.create_task(run_periodic(scrape_gimmeproxy, SCRAPERS["gimmeproxy"])),
-        asyncio.create_task(run_periodic(scrape_pubproxy, SCRAPERS["pubproxy"])),
-        asyncio.create_task(
-            run_periodic(scrape_proxykingdom, SCRAPERS["proxykingdom"])
-        ),
-        asyncio.create_task(run_periodic(scrape_geonode, SCRAPERS["geonode"])),
-        asyncio.create_task(run_periodic(scrape_proxyspace, SCRAPERS["proxyspace"])),
-        asyncio.create_task(
-            run_periodic(scrape_proxy_list_sites, SCRAPERS["proxy_list_sites"])
-        ),
-        asyncio.create_task(writer_loop()),
-        asyncio.create_task(run_proxxy()),
-        asyncio.create_task(scrape_proxyhub(PROXYHUB_INTERVAL, PROXYHUB_CONCURRENCY)),
-        asyncio.create_task(
-            scrape_gatherproxy(GATHER_PROXY_INTERVAL, GATHER_PROXY_CONCURRENCY)
-        ),
-        asyncio.create_task(
-            scrape_openproxylist(OPENPROXYLIST_INTERVAL, OPENPROXYLIST_CONCURRENCY)
-        ),
-        asyncio.create_task(scrape_proxyscraper_sources()),
-        asyncio.create_task(scrape_proxy_list_download()),
-        asyncio.create_task(scrape_freeproxy()),
-        asyncio.create_task(scrape_freshproxy()),
-        asyncio.create_task(scrape_proxifly()),
-        asyncio.create_task(scrape_freeproxy_all()),
-        asyncio.create_task(scrape_kangproxy()),
-        asyncio.create_task(scrape_spys()),
-        asyncio.create_task(scrape_proxybros()),
-        asyncio.create_task(scrape_bloody_proxies()),
-    ]
-    await asyncio.gather(*tasks)
-
+    procs = spawn_dht_processes()
+    async with asyncio.TaskGroup() as tg:
+        tg.create_task(run_periodic(scrape_mt_proxies, SCRAPERS["mtpro"], "mtpro"))
+        tg.create_task(run_periodic(monitor_paste_feeds, SCRAPERS["paste"], "paste"))
+        tg.create_task(run_periodic(scrape_tor_relays, SCRAPERS["tor"], "tor"))
+        tg.create_task(monitor_irc_channels())
+        tg.create_task(run_periodic(scrape_proxyscrape, SCRAPERS["proxyscrape"], "proxyscrape"))
+        tg.create_task(run_periodic(scrape_gimmeproxy, SCRAPERS["gimmeproxy"], "gimmeproxy"))
+        tg.create_task(run_periodic(scrape_pubproxy, SCRAPERS["pubproxy"], "pubproxy"))
+        tg.create_task(run_periodic(scrape_proxykingdom, SCRAPERS["proxykingdom"], "proxykingdom"))
+        tg.create_task(run_periodic(scrape_geonode, SCRAPERS["geonode"], "geonode"))
+        tg.create_task(run_periodic(scrape_proxyspace, SCRAPERS["proxyspace"], "proxyspace"))
+        tg.create_task(run_periodic(scrape_proxy_list_sites, SCRAPERS["proxy_list_sites"], "proxy_list_sites"))
+        tg.create_task(writer_loop())
+        tg.create_task(run_proxxy())
+        tg.create_task(scrape_proxyhub(PROXYHUB_INTERVAL, PROXYHUB_CONCURRENCY))
+        tg.create_task(scrape_gatherproxy(GATHER_PROXY_INTERVAL, GATHER_PROXY_CONCURRENCY))
+        tg.create_task(scrape_openproxylist(OPENPROXYLIST_INTERVAL, OPENPROXYLIST_CONCURRENCY))
+        tg.create_task(scrape_proxyscraper_sources())
+        tg.create_task(scrape_proxy_list_download())
+        tg.create_task(scrape_freeproxy())
+        tg.create_task(scrape_freshproxy())
+        tg.create_task(scrape_proxifly())
+        tg.create_task(scrape_freeproxy_all())
+        tg.create_task(scrape_kangproxy())
+        tg.create_task(scrape_spys())
+        tg.create_task(scrape_proxybros())
+        tg.create_task(scrape_bloody_proxies())
+    for p in procs:
+        p.terminate()
 
 if __name__ == "__main__":
     import sys
@@ -2446,10 +2508,4 @@ if __name__ == "__main__":
         success = filter_p1(sys.argv[1], sys.argv[2])
         sys.exit(0 if success else 1)
 
-    try:
-        import uvloop
-
-        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    except Exception:
-        pass
     asyncio.run(main())

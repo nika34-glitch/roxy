@@ -181,6 +181,10 @@ SPYS_HTTP_URL = "https://spys.me/proxy.txt"
 SPYS_SOCKS_URL = "https://spys.me/socks.txt"
 SPYS_INTERVAL = 300  # fetch every 5 minutes
 
+# ProxyBros free proxy list
+PROXYBROS_URL = "https://proxybros.com/free-proxy-list/"
+PROXYBROS_INTERVAL = 600  # fetch every 10 minutes
+
 proxy_set = set()
 lock = threading.Lock()
 
@@ -862,6 +866,62 @@ def scrape_spys(interval: int = SPYS_INTERVAL) -> None:
         time.sleep(interval)
 
 
+def scrape_proxybros(interval: int = PROXYBROS_INTERVAL) -> None:
+    """Fetch proxies from proxybros.com free proxy list."""
+    base_url = PROXYBROS_URL
+    while True:
+        headers = {"User-Agent": random.choice(USER_AGENTS)}
+        proxies: list[str] = []
+        pages = 1
+        try:
+            resp = requests.get(base_url, headers=headers, timeout=10)
+            resp.raise_for_status()
+            soup = BeautifulSoup(resp.text, "html.parser")
+            nav = soup.select_one("ul.pagination")
+            if nav:
+                for a in nav.find_all("a"):
+                    text = a.get_text(strip=True)
+                    if text.isdigit():
+                        pages = max(pages, int(text))
+            page_soups = [(1, soup)]
+        except Exception as e:
+            print(f"Error fetching {base_url}: {e}", file=sys.stderr)
+            page_soups = []
+
+        for page in range(2, pages + 1):
+            url = f"{base_url}page/{page}/"
+            try:
+                resp = requests.get(url, headers=headers, timeout=10)
+                resp.raise_for_status()
+                page_soups.append((page, BeautifulSoup(resp.text, "html.parser")))
+            except Exception as e:
+                print(f"Error fetching {url}: {e}", file=sys.stderr)
+            time.sleep(random.uniform(1, 3))
+
+        for _, soup in page_soups:
+            for row in soup.select("tbody[data-list] tr"):
+                cols = row.find_all("td")
+                if len(cols) >= 5:
+                    ip_elem = cols[0].find("span", {"data-ip": True})
+                    ip = ip_elem.get_text(strip=True) if ip_elem else cols[0].get_text(strip=True)
+                    port = cols[1].get_text(strip=True)
+                    proto = cols[4].get_text(strip=True).lower()
+                    if ip and port:
+                        proxies.append(f"{proto}:{ip}:{port}")
+
+        if proxies:
+            with lock:
+                added = False
+                for p in proxies:
+                    if p not in proxy_set:
+                        proxy_set.add(p)
+                        added = True
+                if added:
+                    write_proxies_to_file()
+
+        time.sleep(interval)
+
+
 async def _irc_listener(server: str, port: int = 6667) -> None:
     """Connect to an IRC server and monitor channels for proxy announcements."""
     import string
@@ -1119,6 +1179,7 @@ def main() -> None:
         threading.Thread(target=scrape_freeproxy_world, daemon=True),
         threading.Thread(target=scrape_freeproxy_all, daemon=True),
         threading.Thread(target=scrape_kangproxy, daemon=True),
+        threading.Thread(target=scrape_proxybros, daemon=True),
         threading.Thread(target=scrape_spys, daemon=True),
     ]
     for t in threads:

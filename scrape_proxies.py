@@ -12,6 +12,8 @@ import struct
 import json
 from typing import AsyncGenerator, List
 
+from proxyhub import SOURCE_LIST, fetch_source
+
 import aiohttp
 from bs4 import BeautifulSoup
 
@@ -20,6 +22,10 @@ SOCKS_URL = "https://mtpro.xyz/api/?type=socks"
 OUTPUT_FILE = "proxies.txt"
 
 PROXXY_SOURCES_FILE = os.path.join(os.path.dirname(__file__), "vendor", "proXXy", "proxy_sources.json")
+
+# ProxyHub async scraping configuration
+PROXYHUB_INTERVAL = 300.0  # seconds between ProxyHub runs
+PROXYHUB_CONCURRENCY = 20  # max concurrent fetches
 
 MT_INTERVAL = 1  # seconds between mtpro.xyz polls
 PASTE_INTERVAL = 60  # seconds between paste feed checks
@@ -1236,6 +1242,35 @@ async def run_proxxy() -> None:
         await asyncio.sleep(interval)
 
 
+async def scrape_proxyhub(interval: float, concurrency: int) -> None:
+    """Run ProxyHub's asynchronous fetcher alongside other scrapers."""
+
+    async def _fetch(url: str, sem: asyncio.Semaphore) -> List[str]:
+        async with sem:
+            try:
+                return await fetch_source(url)
+            except Exception as e:
+                print(f"proxyhub source error {url}: {e}", file=sys.stderr)
+                return []
+
+    while True:
+        sem = asyncio.Semaphore(concurrency)
+        tasks = [asyncio.create_task(_fetch(url, sem)) for url in SOURCE_LIST]
+        for task in asyncio.as_completed(tasks):
+            proxies = await task
+            if not proxies:
+                continue
+            with lock:
+                added = False
+                for p in proxies:
+                    if p not in proxy_set:
+                        proxy_set.add(p)
+                        added = True
+                if added:
+                    write_proxies_to_file()
+        await asyncio.sleep(interval)
+
+
 def main() -> None:
     threads = [
         threading.Thread(target=scrape_mt_proxies, daemon=True),
@@ -1261,6 +1296,12 @@ def main() -> None:
         threading.Thread(target=scrape_spys, daemon=True),
         threading.Thread(target=scrape_proxybros, daemon=True),
         threading.Thread(target=lambda: asyncio.run(run_proxxy()), daemon=True),
+        threading.Thread(
+            target=lambda: asyncio.run(
+                scrape_proxyhub(PROXYHUB_INTERVAL, PROXYHUB_CONCURRENCY)
+            ),
+            daemon=True,
+        ),
     ]
     for t in threads:
         t.start()

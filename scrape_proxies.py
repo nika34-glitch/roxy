@@ -18,6 +18,8 @@ import orjson
 import regex
 import logging
 import ipaddress
+import itertools
+import aiofiles
 
 from proxyhub import SOURCE_LIST, fetch_source
 
@@ -329,13 +331,32 @@ def normalize_proxy(entry: str) -> str | None:
 
 
 TEST_PROXIES = os.getenv("TEST_PROXIES", "0") == "1"
-TEST_URL = os.getenv("TEST_URL", "http://example.com")
+TEST_URLS = os.getenv("TEST_URLS")
+if TEST_URLS:
+    TEST_URLS = [u.strip() for u in TEST_URLS.split(",") if u.strip()]
+else:
+    TEST_URLS = [
+        "http://example.com",
+        "https://httpbin.org/get",
+        "http://neverssl.com",
+    ]
+_test_url_cycle = itertools.cycle(TEST_URLS)
+TEST_URL = TEST_URLS[0]
 POOL_LIMIT = int(os.getenv("POOL_LIMIT", "50"))
 MIN_POOL_LIMIT = 5
 MAX_POOL_LIMIT = int(os.getenv("MAX_POOL_LIMIT", str((os.cpu_count() or 1) * 20)))
 CHECK_CONNECT_TIMEOUT = float(os.getenv("CHECK_CONNECT_TIMEOUT", "3"))
 CHECK_READ_TIMEOUT = float(os.getenv("CHECK_READ_TIMEOUT", "3"))
 PROXY_CACHE_TTL = int(os.getenv("PROXY_CACHE_TTL", "300"))
+KNOWN_GOOD_TTL = int(os.getenv("KNOWN_GOOD_TTL", "3600"))
+CHECK_CHUNK_SIZE = int(os.getenv("CHECK_CHUNK_SIZE", "200"))
+MAX_RETRIES = int(os.getenv("CHECK_MAX_RETRIES", "2"))
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) Gecko/20100101 Firefox/115.0",
+]
 
 proxy_check_time: dict[str, float] = {}
 proxy_latency: dict[str, float] = {}
@@ -353,13 +374,23 @@ def adjust_pool_limit(success_rate: float) -> None:
 
 
 async def filter_working(proxies: list[str]) -> list[str]:
+    """Return only proxies that successfully perform a simple request."""
     if not TEST_PROXIES:
         return proxies
 
+    results: list[str] = []
+    for i in range(0, len(proxies), CHECK_CHUNK_SIZE):
+        chunk = proxies[i : i + CHECK_CHUNK_SIZE]
+        results.extend(await _filter_chunk(chunk))
+    return results
+
+
+async def _filter_chunk(proxies: list[str]) -> list[str]:
     session = await get_aiohttp_session()
     sem = asyncio.Semaphore(POOL_LIMIT)
     timeout = aiohttp.ClientTimeout(
-        connect=CHECK_CONNECT_TIMEOUT, sock_read=CHECK_READ_TIMEOUT
+        connect=CHECK_CONNECT_TIMEOUT,
+        sock_read=CHECK_READ_TIMEOUT,
     )
 
     async def socks_handshake(ip: str, port: int, proto: str) -> bool:
@@ -395,42 +426,57 @@ async def filter_working(proxies: list[str]) -> list[str]:
 
     async def check(p: str) -> str | None:
         proto, ip, port = p.split(":")
-        if p in proxy_check_time and time.monotonic() - proxy_check_time[p] < PROXY_CACHE_TTL:
+        ttl = KNOWN_GOOD_TTL if p in proxy_latency else PROXY_CACHE_TTL
+        if p in proxy_check_time and time.monotonic() - proxy_check_time[p] < ttl:
             return p
 
-        try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(ip, int(port)), timeout=CHECK_CONNECT_TIMEOUT
-            )
-            writer.close()
-            await writer.wait_closed()
-        except Exception:
-            return None
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                reader, writer = await asyncio.wait_for(
+                    asyncio.open_connection(ip, int(port)),
+                    timeout=CHECK_CONNECT_TIMEOUT,
+                )
+                writer.close()
+                await writer.wait_closed()
+            except Exception:
+                if attempt >= MAX_RETRIES:
+                    return None
+                await asyncio.sleep(2 ** attempt)
+                continue
 
-        start = time.perf_counter()
-        try:
-            async with sem:
-                if proto.startswith("socks"):
-                    if not await socks_handshake(ip, int(port), proto):
-                        return None
-                else:
-                    proxy_url = f"{proto}://{ip}:{port}"
-                    async with session.head(
-                        TEST_URL, proxy=proxy_url, timeout=timeout
-                    ):
-                        pass
-        except Exception:
-            return None
-        latency = time.perf_counter() - start
-        proxy_latency[p] = latency
-        proxy_check_time[p] = time.monotonic()
-        return p
+            start = time.perf_counter()
+            try:
+                async with sem:
+                    if proto.startswith("socks"):
+                        if not await socks_handshake(ip, int(port), proto):
+                            raise RuntimeError("socks handshake failed")
+                    else:
+                        proxy_url = f"{proto}://{ip}:{port}"
+                        headers = {"User-Agent": random.choice(USER_AGENTS)}
+                        async with session.head(
+                            next(_test_url_cycle),
+                            proxy=proxy_url,
+                            timeout=timeout,
+                            headers=headers,
+                        ):
+                            pass
+                latency = time.perf_counter() - start
+                proxy_latency[p] = latency
+                proxy_check_time[p] = time.monotonic()
+                return p
+            except Exception:
+                if attempt >= MAX_RETRIES:
+                    return None
+                await asyncio.sleep(2 ** attempt)
+        return None
 
     tasks = [asyncio.create_task(check(p)) for p in proxies]
+    gathered = await asyncio.gather(*tasks, return_exceptions=True)
     results: list[str] = []
     successes = 0
-    for task in asyncio.as_completed(tasks):
-        res = await task
+    for res in gathered:
+        if isinstance(res, Exception):
+            continue
         if res:
             successes += 1
             results.append(res)
@@ -459,10 +505,12 @@ async def quick_validate(proxies: list[str]) -> list[str]:
             return None
 
     tasks = [asyncio.create_task(check(p)) for p in proxies]
+    gathered = await asyncio.gather(*tasks, return_exceptions=True)
     results: list[str] = []
     successes = 0
-    for task in asyncio.as_completed(tasks):
-        res = await task
+    for res in gathered:
+        if isinstance(res, Exception):
+            continue
         if res:
             successes += 1
             results.append(res)
@@ -476,7 +524,7 @@ def _output_path(proto: str) -> str:
     return os.path.join(OUTPUT_DIR, base)
 
 
-def write_entries(entries: list[str]) -> None:
+async def write_entries(entries: list[str]) -> None:
     proto_groups: dict[str, list[str]] = {}
     for p in entries:
         proto = p.split(":", 1)[0]
@@ -485,10 +533,18 @@ def write_entries(entries: list[str]) -> None:
     for proto, items in proto_groups.items():
         path = _output_path(proto)
         mode = "at" if OUTPUT_COMPRESSED else "a"
-        opener = gzip.open if OUTPUT_COMPRESSED else open
-        with opener(path, mode) as f:
-            for line in items:
-                f.write(line + "\n")
+        if OUTPUT_COMPRESSED:
+            await asyncio.to_thread(_write_gzip, path, items, mode)
+        else:
+            async with aiofiles.open(path, mode) as f:
+                for line in items:
+                    await f.write(line + "\n")
+
+
+def _write_gzip(path: str, items: list[str], mode: str) -> None:
+    with gzip.open(path, mode) as f:
+        for line in items:
+            f.write((line + "\n").encode())
 
 
 async def get_aiohttp_session() -> aiohttp.ClientSession:
@@ -554,7 +610,7 @@ async def writer_loop() -> None:
             new_entries.clear()
         entries = await quick_validate(entries)
         entries = await filter_working(entries)
-        await asyncio.to_thread(write_entries, entries)
+        await write_entries(entries)
         if len(proxy_set) > MAX_PROXY_SET_SIZE:
             logging.info("Flushing proxy set to limit memory usage")
             proxy_set.clear()
@@ -1661,4 +1717,10 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    try:
+        import uvloop
+
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    except Exception:
+        pass
     asyncio.run(main())

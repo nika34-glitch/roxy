@@ -659,10 +659,13 @@ async def measure_latency(ip: str, port: int, proto: str) -> float | None:
         await writer.wait_closed()
         record_attempt(ip, True)
         _latency_cache[key] = (latency_ms, now)
+        STATS["latency_samples"].append(latency_ms)
+        STATS["tls_success"] += 1
         return latency_ms
     except Exception:
         record_attempt(ip, False)
         _latency_cache[key] = (None, now)
+        STATS["tls_fail"] += 1
         return None
 
 
@@ -698,6 +701,7 @@ async def _tls_factor(ip: str, port: int, ctx: ssl.SSLContext) -> float:
             tls_cache[key] = (0.0, now)
             _latency_cache[key] = (None, now)
             record_attempt(ip, False)
+            STATS["tls_fail"] += 1
             return 0.0
 
         try:
@@ -712,6 +716,8 @@ async def _tls_factor(ip: str, port: int, ctx: ssl.SSLContext) -> float:
             await writer.wait_closed()
             _latency_cache[key] = (latency_ms, now)
             record_attempt(ip, True)
+            STATS["latency_samples"].append(latency_ms)
+            STATS["tls_success"] += 1
             if cipher and cipher[0] != "NULL":
                 val = 1.0
             else:
@@ -719,6 +725,7 @@ async def _tls_factor(ip: str, port: int, ctx: ssl.SSLContext) -> float:
         except Exception:
             _latency_cache[key] = (None, now)
             record_attempt(ip, False)
+            STATS["tls_fail"] += 1
             val = 0.5
 
     tls_cache[key] = (val, now)
@@ -853,6 +860,73 @@ USER_AGENTS = [
 proxy_check_time: dict[str, float] = {}
 proxy_latency: dict[str, float] = {}
 
+# --- scraping statistics ---------------------------------------------------
+from collections import defaultdict
+from statistics import mean, median
+
+STATS: dict[str, Any] = {
+    "total_scraped": 0,
+    "source_counts": defaultdict(int),
+    "protocol_counts": defaultdict(int),
+    "quick_validate_pass": 0,
+    "quick_validate_fail": 0,
+    "filter_p1_pass": 0,
+    "filter_p1_fail": 0,
+    "filter_p2_pass": 0,
+    "filter_p2_fail": 0,
+    "score_samples": [],
+    "latency_samples": [],
+    "network_class": defaultdict(int),
+    "country_counts": defaultdict(int),
+    "asn_counts": defaultdict(int),
+    "bad_ja3": 0,
+    "tls_success": 0,
+    "tls_fail": 0,
+    "written_per_proto": defaultdict(int),
+    "flushes": 0,
+    "peak_concurrency": 0,
+    "dht_proxies": 0,
+    "irc_proxies": 0,
+    "paste_proxies": 0,
+    "api_counts": defaultdict(int),
+}
+
+
+def _stats_snapshot() -> dict[str, Any]:
+    """Return a snapshot of the current statistics."""
+    snap = dict(STATS)
+    snap["deduped"] = len(proxy_set)
+    total_qv = snap["quick_validate_pass"] + snap["quick_validate_fail"]
+    snap["quick_validate_rate"] = (
+        snap["quick_validate_pass"] / total_qv if total_qv else 0.0
+    )
+    if STATS["latency_samples"]:
+        snap["latency_avg"] = mean(STATS["latency_samples"])
+        snap["latency_min"] = min(STATS["latency_samples"])
+        snap["latency_max"] = max(STATS["latency_samples"])
+    else:
+        snap["latency_avg"] = snap["latency_min"] = snap["latency_max"] = 0.0
+    if STATS["score_samples"]:
+        snap["score_min"] = min(STATS["score_samples"])
+        snap["score_median"] = median(STATS["score_samples"])
+        snap["score_mean"] = mean(STATS["score_samples"])
+        snap["score_max"] = max(STATS["score_samples"])
+    else:
+        snap["score_min"] = snap["score_median"] = 0.0
+        snap["score_mean"] = snap["score_max"] = 0.0
+    return snap
+
+
+async def stats_loop() -> None:
+    """Periodically write statistics to ``stats.json``."""
+    while True:
+        await asyncio.sleep(1)
+        try:
+            with open("stats.json", "w") as f:
+                json.dump(_stats_snapshot(), f)
+        except Exception as exc:  # pragma: no cover - diagnostics only
+            logging.error("stats write error: %s", exc)
+
 
 def adjust_pool_limit(success_rate: float) -> None:
     """Adjust concurrency based on success rate."""
@@ -863,6 +937,7 @@ def adjust_pool_limit(success_rate: float) -> None:
         POOL_LIMIT = min(MAX_POOL_LIMIT, POOL_LIMIT + 5)
     if aiohttp_session is not None:
         aiohttp_session.connector.limit = POOL_LIMIT
+    STATS["peak_concurrency"] = max(STATS.get("peak_concurrency", 0), POOL_LIMIT)
 
 
 async def filter_working(proxies: list[str]) -> list[str]:
@@ -897,11 +972,15 @@ async def _filter_p1_batch(proxies: list[str], service: str = "pop3") -> list[st
     tasks = [asyncio.create_task(check(p)) for p in proxies]
     gathered = await asyncio.gather(*tasks, return_exceptions=True)
     results: list[str] = []
+    successes = 0
     for res in gathered:
         if isinstance(res, Exception):
             continue
         if res:
+            successes += 1
             results.append(res)
+    STATS["filter_p1_pass"] += successes
+    STATS["filter_p1_fail"] += len(proxies) - successes
     return results
 
 
@@ -1059,6 +1138,8 @@ async def quick_validate(proxies: list[str]) -> list[str]:
             successes += 1
             results.append(res)
     success_rate = successes / len(proxies) if proxies else 0
+    STATS["quick_validate_pass"] += successes
+    STATS["quick_validate_fail"] += len(proxies) - successes
     adjust_pool_limit(success_rate)
     return results
 
@@ -1079,6 +1160,7 @@ async def write_entries(entries: list[str]) -> None:
         mode = "at" if OUTPUT_COMPRESSED else "a"
         if OUTPUT_COMPRESSED:
             await asyncio.to_thread(_write_gzip, path, items, mode)
+            STATS["written_per_proto"][proto] += len(items)
             continue
 
         f = _open_files.get(path)
@@ -1100,6 +1182,7 @@ async def write_entries(entries: list[str]) -> None:
         if buf:
             await f.writelines(buf)
             await f.flush()
+        STATS["written_per_proto"][proto] += len(items)
 
 
 def _write_gzip(path: str, items: list[str], mode: str) -> None:
@@ -1320,6 +1403,13 @@ async def _score_single_proxy(p: str, ctx: ssl.SSLContext) -> tuple[str, int, di
         return None
 
     update_ip_history(ip, True)
+    STATS["score_samples"].append(total_score)
+    STATS["network_class"][netclass] += 1
+    if country:
+        STATS["country_counts"][country] += 1
+    STATS["asn_counts"][asn] += 1
+    if ja3 and ja3 in KNOWN_BAD_JA3:
+        STATS["bad_ja3"] += 1
     scores = {
         "ip": int(ip_factor * WEIGHTS["ip_rep"]),
         "proto": int(type_factor * WEIGHTS["proxy_type"]),
@@ -1360,6 +1450,8 @@ async def filter_p2(proxies: list[str]) -> list[tuple[str, int]]:
                 results.append(res)
         except Exception:
             continue
+    STATS["filter_p2_pass"] += len(results)
+    STATS["filter_p2_fail"] += len(proxies) - len(results)
     return results
 
 
@@ -1387,7 +1479,7 @@ async def get_aiohttp_session() -> Any:
     return aiohttp_session
 
 
-async def add_proxies(proxies: List[str]) -> None:
+async def add_proxies(proxies: List[str], source: str | None = None) -> None:
     async with proxy_lock:
         added = False
         for raw in proxies:
@@ -1395,13 +1487,18 @@ async def add_proxies(proxies: List[str]) -> None:
             if not p or p in proxy_set:
                 continue
             proxy_set.add(p)
+            proto = p.split(":", 1)[0]
+            STATS["total_scraped"] += 1
+            if source:
+                STATS["source_counts"][source] += 1
+            STATS["protocol_counts"][proto] += 1
             new_entries.put_nowait(p)
             added = True
         if added:
             write_event.set()
 
 
-def add_proxies_sync(proxies: List[str]) -> None:
+def add_proxies_sync(proxies: List[str], source: str | None = None) -> None:
     added = False
     with lock:
         for raw in proxies:
@@ -1409,6 +1506,11 @@ def add_proxies_sync(proxies: List[str]) -> None:
             if not p or p in proxy_set:
                 continue
             proxy_set.add(p)
+            proto = p.split(":", 1)[0]
+            STATS["total_scraped"] += 1
+            if source:
+                STATS["source_counts"][source] += 1
+            STATS["protocol_counts"][proto] += 1
             if MAIN_LOOP:
                 MAIN_LOOP.call_soon_threadsafe(new_entries.put_nowait, p)
             else:
@@ -1440,6 +1542,7 @@ async def writer_loop() -> None:
         await write_entries(to_save)
         if len(proxy_set) > MAX_PROXY_SET_SIZE:
             logging.info("Flushing proxy set to limit memory usage")
+            STATS["flushes"] += 1
             proxy_set = ScalableBloomFilter(mode=ScalableBloomFilter.SMALL_SET_GROWTH)
 
 
@@ -1512,7 +1615,7 @@ async def scrape_mt_proxies() -> None:
         logging.error("Error fetching socks proxies: %s", e)
 
     if proxies:
-        await add_proxies(proxies)
+        await add_proxies(proxies, source="mtpro")
 
 
 async def scrape_freeproxy_world() -> None:
@@ -1545,7 +1648,7 @@ async def scrape_freeproxy_world() -> None:
         logging.error("Error fetching freeproxy.world: %s", e)
 
     if proxies:
-        await add_proxies(proxies)
+        await add_proxies(proxies, source="freeproxy_world")
 
 
 def _parse_free_proxy_cz_page(soup: BeautifulSoup) -> list[str]:
@@ -1603,7 +1706,7 @@ async def scrape_free_proxy_cz() -> None:
         logging.error("Error fetching free-proxy.cz: %s", e)
 
     if proxies:
-        await add_proxies(proxies)
+        await add_proxies(proxies, source="free_proxy_cz")
 
 
 async def fetch_with_backoff(url: str, max_retries: int = 5) -> str:
@@ -1662,7 +1765,8 @@ async def monitor_paste_feeds() -> None:
         text = await fetch_with_backoff(feed)
         if text:
             proxies = extract_proxies(text)
-            await add_proxies(proxies)
+            STATS["paste_proxies"] += len(proxies)
+            await add_proxies(proxies, source="paste")
         await asyncio.sleep(random.uniform(*FEED_DELAY_RANGE))
 
 
@@ -1685,7 +1789,7 @@ async def scrape_tor_relays() -> None:
                     proxies.append(f"{host}:{port}")
 
     if proxies:
-        await add_proxies(proxies)
+        await add_proxies(proxies, source="tor")
 
 
 async def scrape_proxyscrape() -> None:
@@ -1706,7 +1810,8 @@ async def scrape_proxyscrape() -> None:
             logging.error("Error fetching %s: %s", url, e)
         await asyncio.sleep(SCRAPERS["proxyscrape"])
     if proxies:
-        await add_proxies(proxies)
+        STATS["api_counts"]["proxyscrape"] += len(proxies)
+        await add_proxies(proxies, source="proxyscrape")
 
 
 def _ps_get(url: str) -> str:
@@ -1845,7 +1950,8 @@ async def scrape_geonode() -> None:
         logging.error("Error fetching geonode proxies: %s", e)
 
     if proxies:
-        await add_proxies(proxies)
+        STATS["api_counts"]["geonode"] += len(proxies)
+        await add_proxies(proxies, source="geonode")
 
 
 async def scrape_proxyspace() -> None:
@@ -1868,7 +1974,8 @@ async def scrape_proxyspace() -> None:
             logging.error("Error fetching %s: %s", url, e)
         await asyncio.sleep(1)
     if proxies:
-        await add_proxies(proxies)
+        STATS["api_counts"]["proxyspace"] += len(proxies)
+        await add_proxies(proxies, source="proxyspace")
 
 
 async def scrape_proxy_list_sites() -> None:
@@ -1895,7 +2002,8 @@ async def scrape_proxy_list_sites() -> None:
                         if IP_PORT_RE.match(f"{ip}:{port}"):
                             proxies.append(f"{proto}:{ip}:{port}")
             if proxies:
-                await add_proxies(proxies)
+                STATS["api_counts"]["proxy_list_sites"] += len(proxies)
+                await add_proxies(proxies, source="proxy_list_sites")
         except Exception as e:
             logging.error("Error fetching %s: %s", url, e)
         await asyncio.sleep(random.uniform(1, 3))
@@ -1923,7 +2031,8 @@ async def scrape_proxy_list_download() -> None:
                 logging.error("Error fetching %s: %s", url, e)
             await asyncio.sleep(interval)
         if proxies:
-            await add_proxies(proxies)
+            STATS["api_counts"]["proxy_list_download"] += len(proxies)
+            await add_proxies(proxies, source="proxy_list_download")
         await asyncio.sleep(interval)
 
 
@@ -1938,7 +2047,8 @@ async def scrape_freeproxy() -> None:
     while True:
         proxies = await download_proxy_list(urls)
         if proxies:
-            await add_proxies(proxies)
+            STATS["api_counts"]["freeproxy"] += len(proxies)
+            await add_proxies(proxies, source="freeproxy")
         await asyncio.sleep(interval)
 
 
@@ -1957,7 +2067,8 @@ async def scrape_freshproxy() -> None:
             if IP_PORT_RE.match(line.split(":", 1)[1]):
                 proxies.append(line)
         if proxies:
-            await add_proxies(proxies)
+            STATS["api_counts"]["freshproxy"] += len(proxies)
+            await add_proxies(proxies, source="freshproxy")
         await asyncio.sleep(interval)
 
 
@@ -1972,7 +2083,8 @@ async def scrape_proxifly() -> None:
     while True:
         entries = await download_proxy_list(urls)
         if entries:
-            await add_proxies(entries)
+            STATS["api_counts"]["proxifly"] += len(entries)
+            await add_proxies(entries, source="proxifly")
         await asyncio.sleep(interval)
 
 
@@ -2000,7 +2112,8 @@ async def scrape_freeproxy_all() -> None:
             logging.error("Error fetching %s: %s", FREEPROXY_ALL_URL, e)
 
         if proxies:
-            await add_proxies(proxies)
+            STATS["api_counts"]["freeproxy_all"] += len(proxies)
+            await add_proxies(proxies, source="freeproxy_all")
         await asyncio.sleep(interval)
 
 
@@ -2031,7 +2144,8 @@ async def scrape_kangproxy() -> None:
             await asyncio.sleep(1)
 
         if proxies:
-            await add_proxies(proxies)
+            STATS["api_counts"]["kangproxy"] += len(proxies)
+            await add_proxies(proxies, source="kangproxy")
         await asyncio.sleep(interval)
 
 
@@ -2081,7 +2195,8 @@ async def scrape_spys() -> None:
             await asyncio.sleep(1)
 
         if proxies:
-            await add_proxies(proxies)
+            STATS["api_counts"]["spys"] += len(proxies)
+            await add_proxies(proxies, source="spys")
 
         await asyncio.sleep(interval)
 
@@ -2118,7 +2233,8 @@ async def scrape_proxybros() -> None:
             logging.error("Error fetching proxybros proxies: %s", e)
 
         if proxies:
-            await add_proxies(proxies)
+            STATS["api_counts"]["proxybros"] += len(proxies)
+            await add_proxies(proxies, source="proxybros")
         await asyncio.sleep(interval)
 
 
@@ -2151,7 +2267,8 @@ async def scrape_bloody_proxies() -> None:
             logging.error("Error running Bloody-Proxy-Scraper: %s", e)
 
         if proxies:
-            await add_proxies(proxies)
+            STATS["api_counts"]["bloody"] += len(proxies)
+            await add_proxies(proxies, source="bloody")
         await asyncio.sleep(interval)
 
 
@@ -2190,7 +2307,8 @@ async def _irc_listener(server: str, port: int = 6667) -> None:
                     continue
                 proxies = extract_proxies(text)
                 if proxies:
-                    add_proxies_sync(proxies)
+                    STATS["irc_proxies"] += len(proxies)
+                    add_proxies_sync(proxies, source="irc")
         except Exception as e:
             logging.error("IRC %s error: %s", server, e)
         finally:
@@ -2381,7 +2499,8 @@ async def crawl_dht() -> None:
                         if p_port in PROXY_PORTS:
                             batch.append(f"{p_ip}:{p_port}")
                     if len(batch) >= 50:
-                        add_proxies_sync(batch)
+                        STATS["dht_proxies"] += len(batch)
+                        add_proxies_sync(batch, source="dht")
                         batch = []
                 except Exception:
                     pass
@@ -2394,7 +2513,8 @@ async def crawl_dht() -> None:
                         len(proxy_set),
                     )
                     if batch:
-                        add_proxies_sync(batch)
+                        STATS["dht_proxies"] += len(batch)
+                        add_proxies_sync(batch, source="dht")
                         batch = []
             queue.task_done()
 
@@ -2418,7 +2538,8 @@ async def run_proxxy() -> None:
         async for batch in fetch_proxxy_sources():
             if not batch:
                 continue
-            add_proxies_sync(batch)
+            STATS["api_counts"]["proxxy"] += len(batch)
+            add_proxies_sync(batch, source="proxxy")
         await asyncio.sleep(interval)
 
 
@@ -2443,7 +2564,8 @@ async def scrape_openproxylist(interval: float, concurrency: int):
         for proxies in results:
             if isinstance(proxies, list):
                 entries.extend(proxies)
-        add_proxies_sync(entries)
+        STATS["api_counts"]["openproxylist"] += len(entries)
+        add_proxies_sync(entries, source="openproxylist")
         await asyncio.sleep(interval)
 
 
@@ -2470,7 +2592,8 @@ async def scrape_proxyhub(
                 proxies = await task
                 if not proxies:
                     continue
-                add_proxies_sync(proxies)
+                STATS["api_counts"]["proxyhub"] += len(proxies)
+                add_proxies_sync(proxies, source="proxyhub")
         await asyncio.sleep(interval)
 
 
@@ -2557,7 +2680,8 @@ async def scrape_gatherproxy(interval: float, concurrency: int):
             entries = [
                 f"{typ.lower()}:{ip}:{port}" for ip, port, typ, country, rt in proxies
             ]
-            add_proxies_sync(entries)
+            STATS["api_counts"]["gatherproxy"] += len(entries)
+            add_proxies_sync(entries, source="gatherproxy")
         await asyncio.sleep(interval)
 
 
@@ -2590,6 +2714,7 @@ async def main() -> None:
         tg.create_task(run_periodic(scrape_proxyspace, SCRAPERS["proxyspace"], "proxyspace"))
         tg.create_task(run_periodic(scrape_proxy_list_sites, SCRAPERS["proxy_list_sites"], "proxy_list_sites"))
         tg.create_task(writer_loop())
+        tg.create_task(stats_loop())
         tg.create_task(run_proxxy())
         tg.create_task(scrape_proxyhub(PROXYHUB_INTERVAL, PROXYHUB_CONCURRENCY))
         tg.create_task(scrape_gatherproxy(GATHER_PROXY_INTERVAL, GATHER_PROXY_CONCURRENCY))

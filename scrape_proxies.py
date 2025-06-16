@@ -42,7 +42,15 @@ try:
 except Exception:
     cy_score_single_proxy = None
 
-from proxyhub import SOURCE_LIST, fetch_source
+try:
+    from proxyhub import SOURCE_LIST, fetch_source
+except ModuleNotFoundError:
+    SOURCE_LIST = []
+
+    async def fetch_source(url: str) -> list[str]:
+        return []
+
+    logging.warning("proxyhub module not found, disabling ProxyHub scraping")
 
 import aiohttp
 from bs4 import BeautifulSoup

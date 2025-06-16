@@ -5,13 +5,16 @@ import random
 import re
 import base64
 import asyncio
+import os
 try:
-    import uvloop
-    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    if os.name != "nt":
+        import uvloop
+        asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    else:
+        uvloop = None
 except Exception:
     uvloop = None
 from functools import lru_cache
-import os
 import socket
 import struct
 import json

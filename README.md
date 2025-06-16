@@ -6,6 +6,7 @@ This repository contains a Python script that continuously gathers proxies from 
 - Python 3
 - `requests` library (`pip install requests`)
 - `beautifulsoup4` (`pip install beautifulsoup4`)
+- `uvloop` (`pip install uvloop`) for best performance
 
 ## Usage
 Run the scraper:

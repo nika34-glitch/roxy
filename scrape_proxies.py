@@ -9,6 +9,7 @@ import os
 import socket
 import struct
 import json
+import ssl
 import importlib.util
 from pathlib import Path
 from typing import AsyncGenerator, List
@@ -290,6 +291,134 @@ lock = threading.Lock()
 
 
 PROTOCOL_RE = re.compile(r"^(https?|socks4|socks5)$", re.I)
+
+# Scoring weights and thresholds for filter_p2
+WEIGHTS = {
+    "ip_rep": 179,
+    "proxy_type": 152,
+    "tls_reach": 152,
+}
+CRITICAL_MIN = 325
+OVERALL_MIN = 325
+
+# TLS caching and blacklist structures
+TLS_CACHE_TTL = 900  # seconds
+tls_cache: dict[str, tuple[float, float]] = {}
+tls_semaphore = asyncio.Semaphore(2000)
+
+_soft_blacklists: set[ipaddress._BaseNetwork] = set()
+_hard_blacklists: set[ipaddress._BaseNetwork] = set()
+_blacklists_loaded = False
+
+
+def _parse_blacklist_lines(lines: list[str], dest: set[ipaddress._BaseNetwork]) -> None:
+    for line in lines:
+        line = line.split("#", 1)[0].split(";", 1)[0].strip()
+        if not line:
+            continue
+        token = line.split()[0]
+        try:
+            dest.add(ipaddress.ip_network(token, strict=False))
+        except Exception:
+            continue
+
+
+async def load_blacklists() -> None:
+    global _blacklists_loaded
+    if _blacklists_loaded:
+        return
+
+    soft_urls = [
+        "https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset",
+    ]
+    hard_urls = [
+        "https://www.spamhaus.org/drop/drop.txt",
+        "https://www.spamhaus.org/drop/edrop.txt",
+    ]
+
+    async def fetch(url: str) -> str:
+        def _get() -> str:
+            resp = requests.get(url, timeout=4)
+            resp.raise_for_status()
+            return resp.text
+
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(_get), timeout=4)
+        except Exception as exc:
+            logging.error("Error loading blacklist %s: %s", url, exc)
+            return ""
+
+    tasks = [asyncio.create_task(fetch(u)) for u in soft_urls + hard_urls]
+    results = await asyncio.gather(*tasks)
+
+    for url, text in zip(soft_urls + hard_urls, results):
+        if not text:
+            continue
+        lines = text.splitlines()
+        if url in soft_urls:
+            _parse_blacklist_lines(lines, _soft_blacklists)
+        else:
+            _parse_blacklist_lines(lines, _hard_blacklists)
+
+    local_dir = Path(__file__).resolve().parent / "data" / "blacklists"
+    if local_dir.exists():
+        for path in local_dir.glob("*.txt"):
+            try:
+                text = path.read_text()
+                _parse_blacklist_lines(text.splitlines(), _hard_blacklists)
+            except Exception as exc:
+                logging.error("Error loading %s: %s", path, exc)
+
+    _blacklists_loaded = True
+
+
+def _ip_rep_factor(ip: ipaddress._BaseAddress) -> float:
+    for net in _hard_blacklists:
+        if ip in net:
+            return 0.0
+    for net in _soft_blacklists:
+        if ip in net:
+            return 0.5
+    return 1.0
+
+
+async def _tls_factor(ip: str, port: int, ctx: ssl.SSLContext) -> float:
+    key = f"{ip}:{port}"
+    now = time.monotonic()
+    cached = tls_cache.get(key)
+    if cached and now - cached[1] < TLS_CACHE_TTL:
+        return cached[0]
+
+    async with tls_semaphore:
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port),
+                timeout=1,
+            )
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            tls_cache[key] = (0.0, now)
+            return 0.0
+
+        try:
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(ip, port, ssl=ctx),
+                timeout=1,
+            )
+            cipher = writer.get_extra_info("cipher")
+            writer.close()
+            await writer.wait_closed()
+            if cipher and cipher[0] != "NULL":
+                val = 1.0
+            else:
+                val = 0.5
+        except Exception:
+            val = 0.5
+
+    tls_cache[key] = (val, now)
+    return val
+
 
 
 def normalize_proxy(entry: str) -> str | None:
@@ -652,6 +781,58 @@ def filter_p1(proxy_url: str, service_name: str) -> bool:
     return result
 
 
+async def filter_p2(proxies: list[str]) -> list[tuple[str, int]]:
+    """Score proxies on the three critical variables."""
+
+    await load_blacklists()
+    ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+
+    async def score(p: str) -> tuple[str, int] | None:
+        norm = normalize_proxy(p)
+        if not norm:
+            return None
+        proto, ip, port = norm.split(":")
+        ip_obj = ipaddress.ip_address(ip)
+
+        ip_factor = _ip_rep_factor(ip_obj)
+        if ip_factor == 0.0:
+            return None
+
+        if proto in ("socks5", "https"):
+            type_factor = 1.0
+        elif proto == "socks4":
+            type_factor = 0.5
+        else:
+            type_factor = 0.0
+        if type_factor == 0.0:
+            return None
+
+        tls_factor = await _tls_factor(ip, int(port), ctx)
+        if tls_factor == 0.0:
+            return None
+
+        score_val = int(
+            ip_factor * WEIGHTS["ip_rep"]
+            + type_factor * WEIGHTS["proxy_type"]
+            + tls_factor * WEIGHTS["tls_reach"]
+        )
+        if score_val >= OVERALL_MIN:
+            return norm, score_val
+        return None
+
+    tasks = [asyncio.create_task(score(p)) for p in proxies]
+    results: list[tuple[str, int]] = []
+    for t in asyncio.as_completed(tasks):
+        try:
+            res = await t
+            if res:
+                results.append(res)
+        except Exception:
+            continue
+    return results
+
+
 
 async def get_aiohttp_session() -> aiohttp.ClientSession:
     global aiohttp_session, httpx_client
@@ -716,8 +897,11 @@ async def writer_loop() -> None:
             new_entries.clear()
         entries = await quick_validate(entries)
         entries = await _filter_p1_batch(entries)
-        entries = await filter_working(entries)
-        await write_entries(entries)
+        entries_with_scores = await filter_p2(entries)
+        score_map = {p: s for p, s in entries_with_scores}
+        entries = await filter_working(list(score_map.keys()))
+        to_save = [f"{p};score={score_map[p]}" for p in entries]
+        await write_entries(to_save)
         if len(proxy_set) > MAX_PROXY_SET_SIZE:
             logging.info("Flushing proxy set to limit memory usage")
             proxy_set.clear()
@@ -1783,6 +1967,7 @@ async def run_periodic(func, interval: float) -> None:
 
 
 async def main() -> None:
+    await load_blacklists()
     tasks = [
         asyncio.create_task(run_periodic(scrape_mt_proxies, SCRAPERS["mtpro"])),
         asyncio.create_task(run_periodic(monitor_paste_feeds, SCRAPERS["paste"])),
@@ -1826,7 +2011,15 @@ async def main() -> None:
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) == 3:
+    if len(sys.argv) == 3 and sys.argv[1] == "filter_p2":
+        import asyncio
+        proxy = sys.argv[2]
+        result = asyncio.run(filter_p2([proxy]))
+        if result:
+            print(f"{result[0][0]}  score={result[0][1]}")
+        else:
+            sys.exit(1)
+    elif len(sys.argv) == 3:
         success = filter_p1(sys.argv[1], sys.argv[2])
         sys.exit(0 if success else 1)
 

@@ -5,8 +5,11 @@ import random
 import re
 import base64
 import asyncio
-import uvloop
-asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+except Exception:
+    uvloop = None
 from functools import lru_cache
 import os
 import socket
@@ -792,7 +795,7 @@ proxy_latency: dict[str, float] = {}
 
 def adjust_pool_limit(success_rate: float) -> None:
     """Adjust concurrency based on success rate."""
-    global POOL_LIMIT, aiohttp_session
+    global POOL_LIMIT
     if success_rate < 0.3 and POOL_LIMIT > MIN_POOL_LIMIT:
         POOL_LIMIT = max(MIN_POOL_LIMIT, int(POOL_LIMIT * 0.8))
     elif success_rate > 0.7 and POOL_LIMIT < MAX_POOL_LIMIT:
@@ -980,7 +983,8 @@ async def quick_validate(proxies: list[str]) -> list[str]:
             record_attempt(ip, True)
             return p
         except Exception:
-            record_attempt(host, False)
+            err_key = ip if 'ip' in locals() and ip else host
+            record_attempt(err_key, False)
             return None
 
     tasks = [asyncio.create_task(check(p)) for p in proxies]
@@ -1038,7 +1042,9 @@ async def write_entries(entries: list[str]) -> None:
 
 
 def _write_gzip(path: str, items: list[str], mode: str) -> None:
-    with gzip.open(path, mode) as f:
+    """Write items to a gzipped file using binary mode."""
+    mode_bin = mode.replace("t", "") + "b"
+    with gzip.open(path, mode_bin) as f:
         buf: list[str] = []
         size = 0
         for line in items:
@@ -1377,11 +1383,17 @@ async def writer_loop() -> None:
 
 
 async def fetch_json(url: str) -> dict:
+    """Fetch JSON from ``url`` using the configured HTTP client."""
     session = await get_aiohttp_session()
-    async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
+    if isinstance(session, aiohttp.ClientSession):
+        async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
+            resp.raise_for_status()
+            data = await resp.read()
+    else:  # httpx client
+        resp = await session.get(url, timeout=REQUEST_TIMEOUT)
         resp.raise_for_status()
-        data = await resp.read()
-        return orjson.loads(data)
+        data = await resp.aread()
+    return orjson.loads(data)
 
 
 async def fetch_proxxy_sources() -> AsyncGenerator[List[str], None]:
@@ -2358,11 +2370,13 @@ async def parse_list(session: aiohttp.ClientSession, url: str) -> list:
 async def scrape_openproxylist(interval: float, concurrency: int):
     sem = asyncio.Semaphore(concurrency)
     session = await get_aiohttp_session()
+
+    async def fetch(url: str) -> list[str]:
+        async with sem:
+            return await parse_list(session, url)
+
     while True:
-        tasks = []
-        for url in OPENPROXYLIST_ENDPOINTS:
-            async with sem:
-                tasks.append(parse_list(session, url))
+        tasks = [asyncio.create_task(fetch(u)) for u in OPENPROXYLIST_ENDPOINTS]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         entries: list[str] = []
         for proxies in results:

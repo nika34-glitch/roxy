@@ -7,6 +7,7 @@ import base64
 import asyncio
 import uvloop
 asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+from functools import lru_cache
 import os
 import socket
 import struct
@@ -18,6 +19,7 @@ from typing import AsyncGenerator, List
 from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
 import gzip
+from io import StringIO
 import orjson
 import regex
 import logging
@@ -59,6 +61,7 @@ PROXXY_SOURCES_FILE = os.path.join(
 # ProxyHub async scraping configuration
 PROXYHUB_INTERVAL = 300.0  # seconds between ProxyHub runs
 PROXYHUB_CONCURRENCY = int(os.getenv("PROXYHUB_CONCURRENCY", "20"))
+PROXYHUB_BATCH_SIZE = int(os.getenv("PROXYHUB_BATCH_SIZE", "100"))
 BLOODY_INTERVAL = 300  # seconds between Bloody-Proxy-Scraper runs
 MAX_PROXY_SET_SIZE = int(os.getenv("MAX_PROXY_SET_SIZE", "100000"))
 
@@ -304,6 +307,9 @@ proxy_lock = asyncio.Lock()
 new_entries: asyncio.Queue[str] = asyncio.Queue()
 write_event = asyncio.Event()
 lock = threading.Lock()
+_open_files: dict[str, aiofiles.BaseFile] = {}
+DNS_CACHE: dict[str, tuple[str, float]] = {}
+DNS_CACHE_TTL = 60.0
 
 
 PROTOCOL_RE = re.compile(r"^(https?|socks4|socks5)$", re.I)
@@ -356,6 +362,9 @@ tls_semaphore = asyncio.Semaphore(2000)
 _soft_blacklists: set[ipaddress._BaseNetwork] = set()
 _hard_blacklists: set[ipaddress._BaseNetwork] = set()
 _blacklists_loaded = False
+PREFIX_LENGTHS = (8, 16, 24)
+_soft_prefixes: dict[int, set[int]] = {n: set() for n in PREFIX_LENGTHS}
+_hard_prefixes: dict[int, set[int]] = {n: set() for n in PREFIX_LENGTHS}
 
 
 def _parse_blacklist_lines(lines: list[str], dest: set[ipaddress._BaseNetwork]) -> None:
@@ -416,6 +425,20 @@ async def load_blacklists() -> None:
             except Exception as exc:
                 logging.error("Error loading %s: %s", path, exc)
 
+    for net in _hard_blacklists:
+        if isinstance(net, ipaddress.IPv4Network):
+            ip_int = int(net.network_address)
+            for plen in PREFIX_LENGTHS:
+                if net.prefixlen <= plen:
+                    _hard_prefixes[plen].add(ip_int >> (32 - plen))
+
+    for net in _soft_blacklists:
+        if isinstance(net, ipaddress.IPv4Network):
+            ip_int = int(net.network_address)
+            for plen in PREFIX_LENGTHS:
+                if net.prefixlen <= plen:
+                    _soft_prefixes[plen].add(ip_int >> (32 - plen))
+
     _blacklists_loaded = True
 
 
@@ -427,13 +450,14 @@ async def load_ja3_sets() -> None:
 
     path = Path(__file__).resolve().parent / "data" / "ja3" / "known_bad.txt"
 
-    def _load() -> set[str]:
-        if not path.exists():
-            return set()
-        with open(path, "r") as f:
-            return {line.strip() for line in f if line.strip()}
+    if not path.exists():
+        KNOWN_BAD_JA3 = set()
+        return
 
-    KNOWN_BAD_JA3 = await asyncio.wait_for(asyncio.to_thread(_load), timeout=4)
+    async with aiofiles.open(path, "r") as f:
+        KNOWN_BAD_JA3 = {
+            line.strip() async for line in f if line.strip()
+        }
 
 
 async def load_asn_metadata() -> None:
@@ -446,29 +470,29 @@ async def load_asn_metadata() -> None:
     map_path = base / "asn_map.csv"
     cloud_path = base / "cloud_asns.txt"
 
-    def _load_map() -> dict[int, str]:
-        import pandas as pd
+    import pandas as pd
 
-        if not map_path.exists():
-            return {}
-        df = pd.read_csv(map_path, dtype=str)
-        result: dict[int, str] = {}
+    if map_path.exists():
+        async with aiofiles.open(map_path, "r") as f:
+            csv_text = await f.read()
+        df = pd.read_csv(StringIO(csv_text), dtype=str)
+        asn_map: dict[int, str] = {}
         for asn, typ in zip(df["asn"], df["type"]):
             try:
-                result[int(asn)] = str(typ)
+                asn_map[int(asn)] = str(typ)
             except Exception:
                 continue
-        return result
+    else:
+        asn_map = {}
 
-    def _load_cloud() -> set[int]:
-        if not cloud_path.exists():
-            return set()
-        with open(cloud_path, "r") as f:
-            return {int(line.strip()) for line in f if line.strip()}
+    if cloud_path.exists():
+        async with aiofiles.open(cloud_path, "r") as f:
+            cloud_lines = [line.strip() async for line in f if line.strip()]
+        cloud_set = {int(line) for line in cloud_lines}
+    else:
+        cloud_set = set()
 
-    load_map = asyncio.create_task(asyncio.to_thread(_load_map))
-    load_cloud = asyncio.create_task(asyncio.to_thread(_load_cloud))
-    ASN_TYPE, CLOUD_ASNS = await asyncio.gather(load_map, load_cloud)
+    ASN_TYPE, CLOUD_ASNS = asn_map, cloud_set
 
 
 async def load_geoip() -> None:
@@ -479,31 +503,33 @@ async def load_geoip() -> None:
 
     path = Path(__file__).resolve().parent / "data" / "geo" / "ip2country.csv"
 
-    def _load() -> list[tuple[int, int, str]]:
-        if not path.exists():
-            return []
-        rows: list[tuple[int, int, str]] = []
-        with open(path, newline="") as f:
-            reader = csv.reader(f)
-            next(reader, None)
-            for row in reader:
-                if len(row) < 3:
-                    continue
-                try:
-                    start = int(row[0])
-                    end = int(row[1])
-                except Exception:
-                    try:
-                        start = int(ipaddress.ip_address(row[0]))
-                        end = int(ipaddress.ip_address(row[1]))
-                    except Exception:
-                        continue
-                cc = row[2].strip().upper()
-                rows.append((start, end, cc))
-        rows.sort(key=lambda r: r[0])
-        return rows
+    if not path.exists():
+        GEO_DATA = []
+        _geo_loaded = True
+        return
 
-    GEO_DATA = await asyncio.to_thread(_load)
+    async with aiofiles.open(path, "r") as f:
+        text = await f.read()
+
+    rows: list[tuple[int, int, str]] = []
+    reader = csv.reader(text.splitlines())
+    next(reader, None)
+    for row in reader:
+        if len(row) < 3:
+            continue
+        try:
+            start = int(row[0])
+            end = int(row[1])
+        except Exception:
+            try:
+                start = int(ipaddress.ip_address(row[0]))
+                end = int(ipaddress.ip_address(row[1]))
+            except Exception:
+                continue
+        cc = row[2].strip().upper()
+        rows.append((start, end, cc))
+    rows.sort(key=lambda r: r[0])
+    GEO_DATA = rows
     _geo_loaded = True
 
 
@@ -577,11 +603,14 @@ async def measure_latency(ip: str, port: int, proto: str) -> float | None:
 
 
 def _ip_rep_factor(ip: ipaddress._BaseAddress) -> float:
-    for net in _hard_blacklists:
-        if ip in net:
+    ip_int = int(ip)
+    for plen in PREFIX_LENGTHS:
+        prefix = ip_int >> (32 - plen)
+        if prefix in _hard_prefixes[plen]:
             return 0.0
-    for net in _soft_blacklists:
-        if ip in net:
+    for plen in PREFIX_LENGTHS:
+        prefix = ip_int >> (32 - plen)
+        if prefix in _soft_prefixes[plen]:
             return 0.5
     return 1.0
 
@@ -690,6 +719,7 @@ def update_ip_history(ip: str, success: bool) -> tuple[int, int]:
 
 
 
+@lru_cache(maxsize=100000)
 def normalize_proxy(entry: str) -> str | None:
     """Return proxy as proto:ip:port if valid, else None."""
     entry = entry.strip()
@@ -740,7 +770,7 @@ else:
     ]
 _test_url_cycle = itertools.cycle(TEST_URLS)
 TEST_URL = TEST_URLS[0]
-POOL_LIMIT = int(os.getenv("POOL_LIMIT", "50"))
+POOL_LIMIT = int(os.getenv("POOL_LIMIT", str(min(200, (os.cpu_count() or 1) * 40))))
 MIN_POOL_LIMIT = 5
 MAX_POOL_LIMIT = int(os.getenv("MAX_POOL_LIMIT", str((os.cpu_count() or 1) * 20)))
 CHECK_CONNECT_TIMEOUT = float(os.getenv("CHECK_CONNECT_TIMEOUT", "3"))
@@ -922,9 +952,15 @@ async def quick_validate(proxies: list[str]) -> list[str]:
     async def resolve(host: str) -> str | None:
         if host.replace(".", "").isdigit():
             return host
+        now = time.monotonic()
+        cached = DNS_CACHE.get(host)
+        if cached and now - cached[1] < DNS_CACHE_TTL:
+            return cached[0]
         try:
             resp = await DNS_RESOLVER.gethostbyname(host, socket.AF_INET)
-            return resp.addresses[0]
+            ip = resp.addresses[0]
+            DNS_CACHE[host] = (ip, now)
+            return ip
         except Exception:
             return None
 
@@ -978,21 +1014,27 @@ async def write_entries(entries: list[str]) -> None:
         mode = "at" if OUTPUT_COMPRESSED else "a"
         if OUTPUT_COMPRESSED:
             await asyncio.to_thread(_write_gzip, path, items, mode)
-        else:
-            async with aiofiles.open(path, mode) as f:
-                buf: list[str] = []
+            continue
+
+        f = _open_files.get(path)
+        if f is None:
+            f = await aiofiles.open(path, mode)
+            _open_files[path] = f
+
+        buf: list[str] = []
+        size = 0
+        for line in items:
+            line = line + "\n"
+            buf.append(line)
+            size += len(line)
+            if size >= 65536:
+                await f.writelines(buf)
+                await f.flush()
+                buf = []
                 size = 0
-                for line in items:
-                    line = line + "\n"
-                    buf.append(line)
-                    size += len(line)
-                    if size >= 65536:
-                        await f.writelines(buf)
-                        await f.flush()
-                        buf = []
-                        size = 0
-                if buf:
-                    await f.writelines(buf)
+        if buf:
+            await f.writelines(buf)
+            await f.flush()
 
 
 def _write_gzip(path: str, items: list[str], mode: str) -> None:
@@ -1345,8 +1387,8 @@ async def fetch_json(url: str) -> dict:
 async def fetch_proxxy_sources() -> AsyncGenerator[List[str], None]:
     """Fetch all proxy sources defined by the proXXy project."""
     try:
-        with open(PROXXY_SOURCES_FILE, "r") as f:
-            sources = json.load(f)
+        async with aiofiles.open(PROXXY_SOURCES_FILE, "r") as f:
+            sources = json.loads(await f.read())
     except Exception as exc:
         logging.error("Error loading %s: %s", PROXXY_SOURCES_FILE, exc)
         return
@@ -1983,16 +2025,22 @@ async def scrape_proxybros() -> None:
                 if resp.status >= 400:
                     raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
                 text = await resp.text()
-            soup = BeautifulSoup(text, "lxml")
-            for row in soup.select("table.proxylist-table tbody tr"):
-                ip_el = row.select_one("span.proxy-ip[data-ip]")
-                port_el = row.select_one("td[data-port]")
-                cells = row.find_all("td")
-                if ip_el and port_el and len(cells) >= 5:
-                    ip = ip_el.get_text(strip=True)
-                    port = port_el.get_text(strip=True)
-                    proto = cells[4].get_text(strip=True).lower()
-                    proxies.append(f"{proto}:{ip}:{port}")
+
+            def _parse() -> list[str]:
+                soup = BeautifulSoup(text, "lxml")
+                out: list[str] = []
+                for row in soup.select("table.proxylist-table tbody tr"):
+                    ip_el = row.select_one("span.proxy-ip[data-ip]")
+                    port_el = row.select_one("td[data-port]")
+                    cells = row.find_all("td")
+                    if ip_el and port_el and len(cells) >= 5:
+                        ip = ip_el.get_text(strip=True)
+                        port = port_el.get_text(strip=True)
+                        proto = cells[4].get_text(strip=True).lower()
+                        out.append(f"{proto}:{ip}:{port}")
+                return out
+
+            proxies = await asyncio.to_thread(_parse)
         except Exception as e:
             logging.error("Error fetching proxybros proxies: %s", e)
 
@@ -2324,7 +2372,9 @@ async def scrape_openproxylist(interval: float, concurrency: int):
         await asyncio.sleep(interval)
 
 
-async def scrape_proxyhub(interval: float, concurrency: int) -> None:
+async def scrape_proxyhub(
+    interval: float, concurrency: int, batch_size: int = PROXYHUB_BATCH_SIZE
+) -> None:
     """Run ProxyHub's asynchronous fetcher alongside other scrapers."""
 
     async def _fetch(url: str, sem: asyncio.Semaphore) -> List[str]:
@@ -2337,12 +2387,15 @@ async def scrape_proxyhub(interval: float, concurrency: int) -> None:
 
     while True:
         sem = asyncio.Semaphore(concurrency)
-        tasks = [asyncio.create_task(_fetch(url, sem)) for url in SOURCE_LIST]
-        for task in asyncio.as_completed(tasks):
-            proxies = await task
-            if not proxies:
-                continue
-            add_proxies_sync(proxies)
+        urls = list(SOURCE_LIST)
+        for i in range(0, len(urls), batch_size):
+            batch = urls[i : i + batch_size]
+            tasks = [asyncio.create_task(_fetch(url, sem)) for url in batch]
+            for task in asyncio.as_completed(tasks):
+                proxies = await task
+                if not proxies:
+                    continue
+                add_proxies_sync(proxies)
         await asyncio.sleep(interval)
 
 
@@ -2435,8 +2488,10 @@ async def scrape_gatherproxy(interval: float, concurrency: int):
 
 async def run_periodic(func, interval: float, key: str | None = None) -> None:
     while True:
+        start = time.monotonic()
         await func()
-        delay = interval
+        elapsed = time.monotonic() - start
+        delay = max(0.0, interval - elapsed)
         if key is not None:
             delay *= 2 ** SOURCE_BACKOFF[key]
         await asyncio.sleep(delay)

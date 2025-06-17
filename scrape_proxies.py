@@ -862,6 +862,14 @@ KNOWN_GOOD_TTL = int(os.getenv("KNOWN_GOOD_TTL", "3600"))
 CHECK_CHUNK_SIZE = int(os.getenv("CHECK_CHUNK_SIZE", "200"))
 MAX_RETRIES = int(os.getenv("CHECK_MAX_RETRIES", "2"))
 
+# Ports to test via HTTP CONNECT against Libero Mail services
+LIBERO_PORTS = [443, 993, 995, 143, 110]
+# hostname used for CONNECT requests
+LIBERO_HOST = "libero.it"
+# per-proxy connect timeout
+CONNECT_TIMEOUT = float(os.getenv("LIBERO_TIMEOUT", "5"))
+
+
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
@@ -900,7 +908,16 @@ STATS: dict[str, Any] = {
     "irc_proxies": 0,
     "paste_proxies": 0,
     "api_counts": defaultdict(int),
+    # counts of proxies able to CONNECT to each Libero Mail port
+    "port_443": 0,
+    "port_993": 0,
+    "port_995": 0,
+    "port_143": 0,
+    "port_110": 0,
 }
+
+# track which ports succeeded for each proxy (http/https only)
+PROXY_PORT_SUCCESS: dict[str, set[int]] = {}
 
 
 def _merge_stats(src: dict[str, Any]) -> None:
@@ -1143,6 +1160,82 @@ async def _filter_chunk(proxies: list[str]) -> list[str]:
     return results
 
 
+async def check_proxy(proxy_url: str) -> bool:
+    """Test proxy via HTTP CONNECT to Libero Mail ports."""
+    from urllib.parse import urlparse
+
+    try:
+        parsed = urlparse(proxy_url)
+        scheme = (parsed.scheme or "http").lower()
+        host = parsed.hostname
+        port = parsed.port or (443 if scheme == "https" else 80)
+        if not host or not port:
+            return False
+        ssl_ctx = ssl.create_default_context() if scheme == "https" else None
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(host, port, ssl=ssl_ctx), timeout=CONNECT_TIMEOUT
+        )
+    except Exception:
+        return False
+
+    success_ports: set[int] = set()
+    try:
+        for target_port in LIBERO_PORTS:
+            req = (
+                f"CONNECT {LIBERO_HOST}:{target_port} HTTP/1.1\r\n"
+                f"Host: {LIBERO_HOST}:{target_port}\r\n\r\n"
+            )
+            try:
+                writer.write(req.encode())
+                await writer.drain()
+                resp = await asyncio.wait_for(reader.read(1024), timeout=CONNECT_TIMEOUT)
+            except Exception:
+                return False
+            if b"200" in resp:
+                success_ports.add(target_port)
+                STATS[f"port_{target_port}"] += 1
+                PROXY_PORT_SUCCESS[proxy_url] = success_ports
+                return True
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+    return False
+
+
+async def filter_libero_ports(proxies: list[str]) -> tuple[list[str], dict[str, set[int]]]:
+    """Run ``check_proxy`` on HTTP/HTTPS proxies and return passing ones."""
+
+    sem = asyncio.Semaphore(POOL_LIMIT)
+
+    async def check(p: str) -> tuple[str, set[int]] | None:
+        proto, host, port = p.split(":")
+        if proto not in {"http", "https"}:
+            return p, set()
+        url = f"{proto}://{host}:{port}"
+        async with sem:
+            ok = await check_proxy(url)
+        if ok:
+            ports = PROXY_PORT_SUCCESS.get(url, set())
+            return p, ports
+        return None
+
+    tasks = [asyncio.create_task(check(p)) for p in proxies]
+    gathered = await asyncio.gather(*tasks, return_exceptions=True)
+    keep: list[str] = []
+    port_map: dict[str, set[int]] = {}
+    for res in gathered:
+        if isinstance(res, Exception) or res is None:
+            continue
+        p, ports = res
+        keep.append(p)
+        if ports:
+            port_map[p] = ports
+    return keep, port_map
+
+
 async def quick_validate(proxies: list[str]) -> list[str]:
     """Check that proxy ports are reachable."""
     sem = asyncio.Semaphore(POOL_LIMIT)
@@ -1238,6 +1331,34 @@ async def write_entries(entries: list[str]) -> None:
             await f.writelines(buf)
             await f.flush()
         STATS["written_per_proto"][proto] += len(items)
+
+
+async def write_libero_entries(port_map: dict[str, set[int]], score_map: dict[str, int]) -> None:
+    """Write proxy URLs to additional files based on Libero port support."""
+
+    groups = {
+        "port443_proxies.txt": {443},
+        "imap_proxies.txt": {993, 143},
+        "pop3_proxies.txt": {995, 110},
+    }
+
+    file_lines: dict[str, list[str]] = {name: [] for name in groups}
+    for proxy, ports in port_map.items():
+        line = f"{proxy};score={score_map[proxy]}"
+        for name, portset in groups.items():
+            if ports & portset:
+                file_lines[name].append(line)
+
+    for name, lines in file_lines.items():
+        if not lines:
+            continue
+        path = os.path.join(OUTPUT_DIR, name)
+        mode = "at" if OUTPUT_COMPRESSED else "a"
+        if OUTPUT_COMPRESSED:
+            await asyncio.to_thread(_write_gzip, path, lines, mode)
+        else:
+            async with aiofiles.open(path, mode) as f:
+                await f.writelines([l + "\n" for l in lines])
 
 
 def _write_gzip(path: str, items: list[str], mode: str) -> None:
@@ -1614,8 +1735,10 @@ async def writer_loop() -> None:
         entries_with_scores = await filter_p2(entries)
         score_map = {p: s for p, s in entries_with_scores}
         entries = await filter_working(list(score_map.keys()))
+        entries, port_map = await filter_libero_ports(entries)
         to_save = [f"{p};score={score_map[p]}" for p in entries]
         await write_entries(to_save)
+        await write_libero_entries(port_map, score_map)
         if len(proxy_set) > MAX_PROXY_SET_SIZE:
             logging.info("Flushing proxy set to limit memory usage")
             STATS["flushes"] += 1

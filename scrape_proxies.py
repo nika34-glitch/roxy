@@ -1002,6 +1002,14 @@ async def filter_working(proxies: list[str]) -> list[str]:
 async def _filter_p1_batch(proxies: list[str], service: str = "pop3") -> list[str]:
     """Run ``filter_p1`` on a list of proxies asynchronously."""
 
+    proxies = [
+        p
+        for p in proxies
+        if p.split(":", 1)[0].lower() in {"socks4", "socks5"}
+    ]
+    if not proxies:
+        return []
+
     sem = asyncio.Semaphore(POOL_LIMIT)
 
     def to_url(p: str) -> str:
@@ -1489,6 +1497,14 @@ async def _score_single_proxy(p: str, ctx: ssl.SSLContext) -> tuple[str, int, di
 
 async def filter_p2(proxies: list[str]) -> list[tuple[str, int]]:
     """Score proxies with multiple heuristics."""
+
+    proxies = [
+        p
+        for p in proxies
+        if p.split(":", 1)[0].lower() in {"socks4", "socks5"}
+    ]
+    if not proxies:
+        return []
 
     await load_blacklists()
     await load_ja3_sets()

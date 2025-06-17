@@ -2250,13 +2250,25 @@ async def scrape_bloody_proxies() -> None:
         / "data"
         / "proxyscraper.py"
     )
-    spec = importlib.util.spec_from_file_location("bloody_proxyscraper", module_path)
+    if not module_path.is_file():
+        logging.warning(
+            "Bloody-Proxy-Scraper module not found, disabling Bloody scraping"
+        )
+        return
+
+    spec = importlib.util.spec_from_file_location(
+        "bloody_proxyscraper", module_path
+    )
     loader = spec.loader if spec else None
     if not spec or loader is None:
         logging.error("Unable to load Bloody-Proxy-Scraper module")
         return
     module = importlib.util.module_from_spec(spec)
-    loader.exec_module(module)
+    try:
+        loader.exec_module(module)
+    except FileNotFoundError:
+        logging.error("Unable to load Bloody-Proxy-Scraper module: file missing")
+        return
     Scraper = module.ProxyScraper
 
     while True:
@@ -2454,9 +2466,14 @@ def _decode_peers(values: list) -> list[tuple[str, int]]:
 async def crawl_dht() -> None:
     loop = asyncio.get_running_loop()
     node_id = os.urandom(20)
-    transport, client = await loop.create_datagram_endpoint(
-        lambda: DHTClient(node_id), local_addr=("0.0.0.0", 0), reuse_port=True
-    )
+    try:
+        transport, client = await loop.create_datagram_endpoint(
+            lambda: DHTClient(node_id), local_addr=("0.0.0.0", 0), reuse_port=True
+        )
+    except ValueError:
+        transport, client = await loop.create_datagram_endpoint(
+            lambda: DHTClient(node_id), local_addr=("0.0.0.0", 0)
+        )
 
     queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
     visited: set[tuple[str, int]] = set()

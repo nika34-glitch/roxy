@@ -903,6 +903,38 @@ STATS: dict[str, Any] = {
 }
 
 
+def _merge_stats(src: dict[str, Any]) -> None:
+    """Merge ``src`` counters into ``STATS``."""
+    for key, value in src.items():
+        if key not in STATS:
+            STATS[key] = value
+            continue
+        cur = STATS[key]
+        if isinstance(cur, defaultdict):
+            for sk, sv in value.items():
+                cur[sk] += sv
+        elif isinstance(cur, list):
+            cur.extend(value)
+        elif isinstance(cur, (int, float)):
+            STATS[key] = cur + value
+
+
+def load_previous_stats(path: str = "stats.json") -> None:
+    """Load existing stats file and merge into ``STATS``."""
+    if not os.path.exists(path):
+        return
+    try:
+        with open(path) as f:
+            prev = json.load(f)
+        if isinstance(prev, dict):
+            _merge_stats(prev)
+    except Exception as exc:  # pragma: no cover - diagnostics only
+        logging.error("stats load error: %s", exc)
+
+
+load_previous_stats()
+
+
 def _stats_snapshot() -> dict[str, Any]:
     """Return a snapshot of the current statistics."""
     snap = dict(STATS)
@@ -1300,7 +1332,22 @@ def filter_p1(proxy_url: str, service_name: str) -> bool:
 
 async def _score_single_proxy(p: str, ctx: ssl.SSLContext) -> tuple[str, int, dict[str, int]] | None:
     if cy_score_single_proxy is not None:
-        return cy_score_single_proxy(p)
+        result = cy_score_single_proxy(p)
+        if not result:
+            return None
+        norm, total = result[0], result[1]
+        extra = result[2] if len(result) > 2 else {}
+        STATS["score_samples"].append(total)
+        lat = extra.get("lat") or extra.get("latency")
+        if lat is not None:
+            STATS["latency_samples"].append(lat)
+        if "country" in extra:
+            STATS["country_counts"][extra["country"]] += 1
+        if "netclass" in extra:
+            STATS["network_class"][extra["netclass"]] += 1
+        if "asn" in extra:
+            STATS["asn_counts"][extra["asn"]] += 1
+        return norm, total, extra
     norm = normalize_proxy(p)
     if not norm:
         return None
@@ -1494,7 +1541,7 @@ async def get_aiohttp_session() -> Any:
     return aiohttp_session
 
 
-async def add_proxies(proxies: List[str], source: str | None = None) -> None:
+async def add_proxies(proxies: List[str], source: str = "unknown") -> None:
     async with proxy_lock:
         added = False
         for raw in proxies:
@@ -1504,8 +1551,7 @@ async def add_proxies(proxies: List[str], source: str | None = None) -> None:
             proxy_set.add(p)
             proto = p.split(":", 1)[0]
             STATS["total_scraped"] += 1
-            if source:
-                STATS["source_counts"][source] += 1
+            STATS["source_counts"][source] += 1
             STATS["protocol_counts"][proto] += 1
             new_entries.put_nowait(p)
             added = True
@@ -1513,7 +1559,7 @@ async def add_proxies(proxies: List[str], source: str | None = None) -> None:
             write_event.set()
 
 
-def add_proxies_sync(proxies: List[str], source: str | None = None) -> None:
+def add_proxies_sync(proxies: List[str], source: str = "unknown") -> None:
     added = False
     with lock:
         for raw in proxies:
@@ -1523,8 +1569,7 @@ def add_proxies_sync(proxies: List[str], source: str | None = None) -> None:
             proxy_set.add(p)
             proto = p.split(":", 1)[0]
             STATS["total_scraped"] += 1
-            if source:
-                STATS["source_counts"][source] += 1
+            STATS["source_counts"][source] += 1
             STATS["protocol_counts"][proto] += 1
             if MAIN_LOOP:
                 MAIN_LOOP.call_soon_threadsafe(new_entries.put_nowait, p)
@@ -1559,6 +1604,51 @@ async def writer_loop() -> None:
             logging.info("Flushing proxy set to limit memory usage")
             STATS["flushes"] += 1
             proxy_set = ScalableBloomFilter(mode=ScalableBloomFilter.SMALL_SET_GROWTH)
+
+
+def _load_all_saved_proxies() -> list[str]:
+    """Return all proxies from the output file (if present)."""
+    path = os.path.join(OUTPUT_DIR, OUTPUT_FILE)
+    proxies: list[str] = []
+    if os.path.exists(path):
+        opener = gzip.open if OUTPUT_COMPRESSED else open
+        mode = "rt"
+        with opener(path, mode) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                line = line.split(";", 1)[0]
+                if normalize_proxy(line):
+                    proxies.append(line)
+    return proxies
+
+
+async def run_filter_p1_all(service: str = "pop3") -> None:
+    """Run filter_p1 over all known proxies and print passing ones."""
+    proxies = _load_all_saved_proxies()
+    while True:
+        try:
+            proxies.append(new_entries.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+    proxies = await quick_validate(proxies)
+    results = await _filter_p1_batch(proxies, service)
+    for p in results:
+        print(p)
+
+
+async def run_filter_p2_all() -> None:
+    """Run filter_p2 over all known proxies and print scored ones."""
+    proxies = _load_all_saved_proxies()
+    while True:
+        try:
+            proxies.append(new_entries.get_nowait())
+        except asyncio.QueueEmpty:
+            break
+    results = await filter_p2(proxies)
+    for p, score in results:
+        print(f"{p};score={score}")
 
 
 async def fetch_json(url: str) -> dict:
@@ -1859,7 +1949,7 @@ async def scrape_proxyscraper_sources(interval: int = PS_INTERVAL) -> None:
                         new_entries.append(f"{proto}:{line}")
 
         if new_entries:
-            await add_proxies(new_entries)
+            await add_proxies(new_entries, source="proxyscraper")
 
         await asyncio.sleep(interval)
 
@@ -1907,7 +1997,7 @@ async def scrape_gimmeproxy() -> None:
         port = data.get("port")
         protocol = data.get("protocol")
         if ip and port and protocol:
-            await add_proxies([f"{protocol.lower()}:{ip}:{port}"])
+            await add_proxies([f"{protocol.lower()}:{ip}:{port}"], source="gimmeproxy")
     except Exception as e:
         logging.error("Error fetching gimmeproxy: %s", e)
 
@@ -1929,7 +2019,7 @@ async def scrape_pubproxy() -> None:
                 port = item.get("port")
             protocol = item.get("type", "http")
             if ip and port:
-                await add_proxies([f"{protocol.lower()}:{ip}:{port}"])
+                await add_proxies([f"{protocol.lower()}:{ip}:{port}"], source="pubproxy")
     except Exception as e:
         logging.error("Error fetching pubproxy: %s", e)
 
@@ -1944,7 +2034,7 @@ async def scrape_proxykingdom() -> None:
         port = data.get("port")
         protocol = data.get("protocol")
         if ip and port and protocol:
-            await add_proxies([f"{protocol.lower()}:{ip}:{port}"])
+            await add_proxies([f"{protocol.lower()}:{ip}:{port}"], source="proxykingdom")
     except Exception as e:
         logging.error("Error fetching proxykingdom: %s", e)
 
@@ -2772,30 +2862,46 @@ async def main() -> None:
 if __name__ == "__main__":
     import sys
 
-    if len(sys.argv) == 3 and sys.argv[1] == "filter_p2":
+    if len(sys.argv) >= 2 and sys.argv[1] == "filter_p1":
         import asyncio
 
-        proxy = sys.argv[2]
+        if len(sys.argv) == 4:
+            proxy = sys.argv[2]
+            service = sys.argv[3]
+            success = filter_p1(proxy, service)
+            sys.exit(0 if success else 1)
+        service = sys.argv[2] if len(sys.argv) >= 3 else "pop3"
+        asyncio.run(run_filter_p1_all(service))
+        sys.exit(0)
 
-        async def _run() -> int:
-            ctx = ssl.create_default_context()
-            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-            await load_blacklists()
-            await load_ja3_sets()
-            await load_asn_metadata()
-            await load_geoip()
-            res = await _score_single_proxy(proxy, ctx)
-            if not res:
-                return 1
-            p, total, parts = res
-            print(
-                f"{p} score={total} ip={parts['ip']} proto={parts['proto']} tls={parts['tls']} "
-                f"ja3={parts['ja3']} fresh={parts['fresh']} net={parts['net']} asn={parts['asn']} "
-                f"err={parts['err']} geo={parts['geo']} lat={parts['lat']}"
-            )
-            return 0
+    if len(sys.argv) >= 2 and sys.argv[1] == "filter_p2":
+        import asyncio
+        if len(sys.argv) == 3:
+            proxy = sys.argv[2]
 
-        sys.exit(asyncio.run(_run()))
+            async def _run() -> int:
+                ctx = ssl.create_default_context()
+                ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+                await load_blacklists()
+                await load_ja3_sets()
+                await load_asn_metadata()
+                await load_geoip()
+                res = await _score_single_proxy(proxy, ctx)
+                if not res:
+                    return 1
+                p, total, parts = res
+                print(
+                    f"{p} score={total} ip={parts['ip']} proto={parts['proto']} tls={parts['tls']} "
+                    f"ja3={parts['ja3']} fresh={parts['fresh']} net={parts['net']} asn={parts['asn']} "
+                    f"err={parts['err']} geo={parts['geo']} lat={parts['lat']}"
+                )
+                return 0
+
+            sys.exit(asyncio.run(_run()))
+        else:
+            asyncio.run(run_filter_p2_all())
+            sys.exit(0)
+
     elif len(sys.argv) == 3:
         success = filter_p1(sys.argv[1], sys.argv[2])
         sys.exit(0 if success else 1)

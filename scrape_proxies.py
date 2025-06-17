@@ -80,13 +80,15 @@ except Exception:
 
 try:
     from proxyhub import SOURCE_LIST, fetch_source
-except ModuleNotFoundError:
+except ImportError:
     SOURCE_LIST = []
 
     async def fetch_source(url: str) -> list[str]:
         return []
 
-    logging.warning("proxyhub module not found, disabling ProxyHub scraping")
+    logging.warning(
+        "proxyhub module not found or incomplete, disabling ProxyHub scraping"
+    )
 
 try:
     import aiohttp  # type: ignore

@@ -938,7 +938,11 @@ def adjust_pool_limit(success_rate: float) -> None:
     elif success_rate > 0.7 and POOL_LIMIT < MAX_POOL_LIMIT:
         POOL_LIMIT = min(MAX_POOL_LIMIT, POOL_LIMIT + 5)
     if aiohttp_session is not None:
-        aiohttp_session.connector.limit = POOL_LIMIT
+        # ``aiohttp`` exposes ``connector.limit`` as a read-only property, so we
+        # update the underlying attribute directly.  This avoids ``AttributeError``
+        # when adjusting the pool size at runtime.
+        if hasattr(aiohttp_session.connector, "_limit"):
+            aiohttp_session.connector._limit = POOL_LIMIT
     STATS["peak_concurrency"] = max(STATS.get("peak_concurrency", 0), POOL_LIMIT)
 
 

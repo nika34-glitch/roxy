@@ -2524,10 +2524,15 @@ async def crawl_dht() -> None:
     await asyncio.gather(*workers)
 
 
+def _run_crawl_dht() -> None:
+    """Wrapper to execute crawl_dht inside a child process."""
+    asyncio.run(crawl_dht())
+
+
 def spawn_dht_processes() -> list[multiprocessing.Process]:
     procs = []
     for _ in range(DHT_PROCESSES):
-        p = multiprocessing.Process(target=lambda: asyncio.run(crawl_dht()))
+        p = multiprocessing.Process(target=_run_crawl_dht)
         p.start()
         procs.append(p)
     return procs

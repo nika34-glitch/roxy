@@ -100,6 +100,15 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     BeautifulSoup = None  # type: ignore
 
+def create_soup(text: str):
+    """Return ``BeautifulSoup`` object using available parser."""
+    if BeautifulSoup is None:
+        raise RuntimeError("BeautifulSoup not available")
+    try:
+        return BeautifulSoup(text, "lxml")
+    except Exception:
+        return BeautifulSoup(text, "html.parser")
+
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
 
 MTPROTO_URL = "https://mtpro.xyz/api/?type=mtproto"
@@ -1632,7 +1641,7 @@ async def scrape_freeproxy_world() -> None:
         text = await fetch_with_backoff(base_url)
         if not text:
             return
-        soup = BeautifulSoup(text, "lxml")
+        soup = create_soup(text)
         count_div = soup.select_one(".proxy_table_pages")
         total = int(count_div.get("data-counts", "0")) if count_div else 0
         pages = max(1, (total + 49) // 50)
@@ -1641,7 +1650,7 @@ async def scrape_freeproxy_world() -> None:
                 page_text = await fetch_with_backoff(base_url + f"?page={page}")
                 if not page_text:
                     break
-                soup = BeautifulSoup(page_text, "lxml")
+                soup = create_soup(page_text)
                 for row in soup.select("tbody tr"):
                     cols = [td.get_text(strip=True) for td in row.find_all("td")]
                     if len(cols) >= 6 and cols[0] and cols[1].isdigit():
@@ -1690,7 +1699,7 @@ async def scrape_free_proxy_cz() -> None:
         text = await fetch_with_backoff(f"{base_url}/en/")
         if not text:
             return
-        soup = BeautifulSoup(text, "lxml")
+        soup = create_soup(text)
         proxies.extend(_parse_free_proxy_cz_page(soup))
         links = soup.select('a[href^="/en/proxylist/main/"]')
         for a in links:
@@ -1703,7 +1712,7 @@ async def scrape_free_proxy_cz() -> None:
                 page_text = await fetch_with_backoff(url)
                 if not page_text:
                     break
-                soup = BeautifulSoup(page_text, "lxml")
+                soup = create_soup(page_text)
                 proxies.extend(_parse_free_proxy_cz_page(soup))
             except Exception as e:
                 logging.error("Error fetching free-proxy.cz page %s: %s", page, e)
@@ -1990,7 +1999,7 @@ async def scrape_proxy_list_sites() -> None:
             text = await fetch_with_backoff(url)
             if not text:
                 continue
-            soup = BeautifulSoup(text, "lxml")
+            soup = create_soup(text)
             proxies = []
             textarea = soup.find("textarea")
             if textarea:

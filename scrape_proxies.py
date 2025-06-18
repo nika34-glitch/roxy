@@ -6,11 +6,9 @@ import re
 import base64
 import asyncio
 import os
-
 try:
     if os.name != "nt":
         import uvloop
-
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     else:
         uvloop = None
@@ -28,7 +26,6 @@ from concurrent.futures import ThreadPoolExecutor
 import multiprocessing
 import gzip
 from io import StringIO
-
 try:
     import orjson  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
@@ -48,9 +45,9 @@ import aiofiles
 # attribute is only used for type hints, so provide a minimal stub when
 # missing to avoid ``AttributeError`` at import time.
 if not hasattr(aiofiles, "BaseFile"):
-
     class _BF:
         pass
+
 
     aiofiles.BaseFile = _BF  # type: ignore[attr-defined]
 
@@ -62,12 +59,10 @@ except Exception:  # pragma: no cover - optional dependency
 import csv
 import bisect
 from collections import defaultdict
-from statistics import mean, median
 
 try:
     from pybloom_live import ScalableBloomFilter  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
-
     class ScalableBloomFilter:  # minimal stub
         SMALL_SET_GROWTH = 2
 
@@ -79,8 +74,6 @@ except Exception:  # pragma: no cover - optional dependency
 
         def __contains__(self, item):
             return False
-
-
 try:
     from score_cython import score_single_proxy as cy_score_single_proxy
 except Exception:
@@ -108,7 +101,6 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     BeautifulSoup = None  # type: ignore
 
-
 def create_soup(text: str):
     """Return ``BeautifulSoup`` object using available parser."""
     if BeautifulSoup is None:
@@ -117,7 +109,6 @@ def create_soup(text: str):
         return BeautifulSoup(text, "lxml")
     except Exception:
         return BeautifulSoup(text, "html.parser")
-
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
 
@@ -378,13 +369,10 @@ httpx_client = None
 USE_HTTP2 = os.getenv("USE_HTTP2", "0") == "1"
 MAIN_LOOP: asyncio.AbstractEventLoop | None = None
 
-proxy_set: ScalableBloomFilter = ScalableBloomFilter(
-    mode=ScalableBloomFilter.SMALL_SET_GROWTH
-)
+proxy_set: ScalableBloomFilter = ScalableBloomFilter(mode=ScalableBloomFilter.SMALL_SET_GROWTH)
 if aiodns is not None:
     DNS_RESOLVER = aiodns.DNSResolver()
 else:  # pragma: no cover - optional dependency missing
-
     class _DummyResolver:
         async def gethostbyname(self, host, family):
             raise RuntimeError("aiodns not available")
@@ -435,7 +423,7 @@ def load_scoring_config(path: str | None = None) -> None:
     try:
         with open(file_path, "r") as f:
             text = f.read()
-        if file_path.endswith((".yml", ".yaml")) and yaml is not None:
+        if file_path.endswith(('.yml', '.yaml')) and yaml is not None:
             cfg = yaml.safe_load(text)
         else:
             cfg = json.loads(text)
@@ -483,33 +471,8 @@ ALLOWLIST_FILE = os.getenv(
 ALLOWED_COUNTRIES: set[str] = {"IT"}
 ALLOWED_ASNS: set[int] = set()
 EU_COUNTRIES = {
-    "AT",
-    "BE",
-    "BG",
-    "HR",
-    "CY",
-    "CZ",
-    "DK",
-    "EE",
-    "FI",
-    "FR",
-    "DE",
-    "GR",
-    "HU",
-    "IE",
-    "IT",
-    "LV",
-    "LT",
-    "LU",
-    "MT",
-    "NL",
-    "PL",
-    "PT",
-    "RO",
-    "SK",
-    "SI",
-    "ES",
-    "SE",
+    "AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU",
+    "IE","IT","LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE"
 }
 
 ERR_STATS: defaultdict[str, dict] = defaultdict(
@@ -620,7 +583,9 @@ async def load_ja3_sets() -> None:
         return
 
     async with aiofiles.open(path, "r") as f:
-        KNOWN_BAD_JA3 = {line.strip() async for line in f if line.strip()}
+        KNOWN_BAD_JA3 = {
+            line.strip() async for line in f if line.strip()
+        }
 
 
 async def load_asn_metadata() -> None:
@@ -717,7 +682,6 @@ def load_allow_lists(path: str | None = None) -> None:
             except Exception:
                 continue
         ALLOWED_ASNS = tmp
-
 
 load_allow_lists()
 
@@ -875,9 +839,7 @@ async def get_ja3(proxy: str) -> str | None:
             writer.close()
             await writer.wait_closed()
             # Python's default handshake JA3
-            ja3 = (
-                "771,49195-49199-49196-49172-57-56-61-60-53-47,0-11-10-35-23-13,23-24,0"
-            )
+            ja3 = "771,49195-49199-49196-49172-57-56-61-60-53-47,0-11-10-35-23-13,23-24,0"
         except Exception:
             ja3 = None
 
@@ -931,6 +893,7 @@ def get_freshness(proxy_id: str) -> float:
     return val * decay + (1.0 * (1 - decay))
 
 
+
 @lru_cache(maxsize=100000)
 def normalize_proxy(entry: str) -> str | None:
     """Return proxy as proto:ip:port if valid, else None."""
@@ -982,10 +945,9 @@ else:
     ]
 _test_url_cycle = itertools.cycle(TEST_URLS)
 TEST_URL = TEST_URLS[0]
-# Use very high default concurrency for validation
-POOL_LIMIT = int(os.getenv("POOL_LIMIT", "2000"))
+POOL_LIMIT = int(os.getenv("POOL_LIMIT", str(min(200, (os.cpu_count() or 1) * 40))))
 MIN_POOL_LIMIT = 5
-MAX_POOL_LIMIT = int(os.getenv("MAX_POOL_LIMIT", "4000"))
+MAX_POOL_LIMIT = int(os.getenv("MAX_POOL_LIMIT", str((os.cpu_count() or 1) * 20)))
 CHECK_CONNECT_TIMEOUT = float(os.getenv("CHECK_CONNECT_TIMEOUT", "3"))
 CHECK_READ_TIMEOUT = float(os.getenv("CHECK_READ_TIMEOUT", "3"))
 PROXY_CACHE_TTL = int(os.getenv("PROXY_CACHE_TTL", "300"))
@@ -1012,6 +974,8 @@ proxy_latency: dict[str, float] = {}
 PROXY_ID_MAP: dict[str, str] = {}
 
 # --- scraping statistics ---------------------------------------------------
+from collections import defaultdict
+from statistics import mean, median
 
 STATS: dict[str, Any] = {
     "total_scraped": 0,
@@ -1115,7 +1079,17 @@ async def stats_loop() -> None:
 
 def adjust_pool_limit(success_rate: float) -> None:
     """Adjust concurrency based on success rate."""
-    """Deprecated: no longer adjusts concurrency dynamically."""
+    global POOL_LIMIT
+    if success_rate < 0.3 and POOL_LIMIT > MIN_POOL_LIMIT:
+        POOL_LIMIT = max(MIN_POOL_LIMIT, int(POOL_LIMIT * 0.8))
+    elif success_rate > 0.7 and POOL_LIMIT < MAX_POOL_LIMIT:
+        POOL_LIMIT = min(MAX_POOL_LIMIT, POOL_LIMIT + 5)
+    if aiohttp_session is not None:
+        # ``aiohttp`` exposes ``connector.limit`` as a read-only property, so we
+        # update the underlying attribute directly.  This avoids ``AttributeError``
+        # when adjusting the pool size at runtime.
+        if hasattr(aiohttp_session.connector, "_limit"):
+            aiohttp_session.connector._limit = POOL_LIMIT
     STATS["peak_concurrency"] = max(STATS.get("peak_concurrency", 0), POOL_LIMIT)
 
 
@@ -1134,7 +1108,11 @@ async def filter_working(proxies: list[str]) -> list[str]:
 async def _filter_p1_batch(proxies: list[str], service: str = "pop3") -> list[str]:
     """Run ``filter_p1`` on a list of proxies asynchronously."""
 
-    proxies = [p for p in proxies if p.split(":", 1)[0].lower() in {"socks4", "socks5"}]
+    proxies = [
+        p
+        for p in proxies
+        if p.split(":", 1)[0].lower() in {"socks4", "socks5"}
+    ]
     if not proxies:
         return []
 
@@ -1224,7 +1202,7 @@ async def _filter_chunk(proxies: list[str]) -> list[str]:
             except Exception:
                 if attempt >= MAX_RETRIES:
                     break
-                await asyncio.sleep(2**attempt)
+                await asyncio.sleep(2 ** attempt)
                 continue
 
             start = time.perf_counter()
@@ -1251,7 +1229,7 @@ async def _filter_chunk(proxies: list[str]) -> list[str]:
             except Exception:
                 if attempt >= MAX_RETRIES:
                     break
-                await asyncio.sleep(2**attempt)
+                await asyncio.sleep(2 ** attempt)
         record_attempt(ip, success)
         return p if success else None
 
@@ -1299,9 +1277,7 @@ async def check_proxy(proxy_url: str) -> bool:
             try:
                 writer.write(req.encode())
                 await writer.drain()
-                resp = await asyncio.wait_for(
-                    reader.read(1024), timeout=CONNECT_TIMEOUT
-                )
+                resp = await asyncio.wait_for(reader.read(1024), timeout=CONNECT_TIMEOUT)
             except Exception:
                 return False
             if b"200" in resp:
@@ -1318,9 +1294,7 @@ async def check_proxy(proxy_url: str) -> bool:
     return False
 
 
-async def filter_libero_ports(
-    proxies: list[str],
-) -> tuple[list[str], dict[str, set[int]]]:
+async def filter_libero_ports(proxies: list[str]) -> tuple[list[str], dict[str, set[int]]]:
     """Run ``check_proxy`` on HTTP/HTTPS proxies and return passing ones."""
 
     sem = asyncio.Semaphore(POOL_LIMIT)
@@ -1386,7 +1360,7 @@ async def quick_validate(proxies: list[str]) -> list[str]:
             record_attempt(ip, True)
             return p
         except Exception:
-            err_key = ip if "ip" in locals() and ip else host
+            err_key = ip if 'ip' in locals() and ip else host
             record_attempt(err_key, False)
             return None
 
@@ -1448,9 +1422,7 @@ async def write_entries(entries: list[str]) -> None:
         STATS["written_per_proto"][proto] += len(items)
 
 
-async def write_libero_entries(
-    port_map: dict[str, set[int]], score_map: dict[str, int]
-) -> None:
+async def write_libero_entries(port_map: dict[str, set[int]], score_map: dict[str, int]) -> None:
     """Write proxy URLs to additional files based on Libero port support."""
 
     groups = {
@@ -1475,7 +1447,7 @@ async def write_libero_entries(
             await asyncio.to_thread(_write_gzip, path, lines, mode)
         else:
             async with aiofiles.open(path, mode) as f:
-                await f.writelines([line + "\n" for line in lines])
+                await f.writelines([l + "\n" for l in lines])
 
 
 def _write_gzip(path: str, items: list[str], mode: str) -> None:
@@ -1496,9 +1468,7 @@ def _write_gzip(path: str, items: list[str], mode: str) -> None:
             f.write("".join(buf).encode())
 
 
-async def check_http_connect(
-    proxy: str, host: str = "example.com", port: int = 443
-) -> bool:
+async def check_http_connect(proxy: str, host: str = "example.com", port: int = 443) -> bool:
     """Return True if an HTTP proxy supports the CONNECT method."""
     proto, ip, p = proxy.split(":")
     if proto not in {"http", "https"}:
@@ -1557,36 +1527,6 @@ async def write_http_connect_entries(entries: list[str]) -> None:
     if not entries:
         return
     path = os.path.join(OUTPUT_DIR, "http_connect_method.txt")
-    mode = "at" if OUTPUT_COMPRESSED else "a"
-    if OUTPUT_COMPRESSED:
-        await asyncio.to_thread(_write_gzip, path, entries, mode)
-        return
-    f = _open_files.get(path)
-    if f is None:
-        f = await aiofiles.open(path, mode)
-        _open_files[path] = f
-
-    buf: list[str] = []
-    size = 0
-    for line in entries:
-        line = line + "\n"
-        buf.append(line)
-        size += len(line)
-        if size >= 65536:
-            await f.writelines(buf)
-            await f.flush()
-            buf = []
-            size = 0
-    if buf:
-        await f.writelines(buf)
-        await f.flush()
-
-
-async def write_p1_pass_entries(entries: list[str]) -> None:
-    """Append SOCKS proxies that pass ``filter_p1`` to ``p1_pass.txt``."""
-    if not entries:
-        return
-    path = os.path.join(OUTPUT_DIR, "p1_pass.txt")
     mode = "at" if OUTPUT_COMPRESSED else "a"
     if OUTPUT_COMPRESSED:
         await asyncio.to_thread(_write_gzip, path, entries, mode)
@@ -1773,7 +1713,11 @@ async def filter_p2(
     ``quarantine`` list will always be empty.
     """
 
-    proxies = [p for p in proxies if p.split(":", 1)[0].lower() in {"socks4", "socks5"}]
+    proxies = [
+        p
+        for p in proxies
+        if p.split(":", 1)[0].lower() in {"socks4", "socks5"}
+    ]
     if not proxies:
         return [], []
 
@@ -1808,6 +1752,7 @@ async def filter_p2(
     STATS["filter_p2_fail"] += len(proxies) - len(accepted)
 
     return accepted, quarantine
+
 
 
 async def get_aiohttp_session() -> Any:
@@ -1889,9 +1834,7 @@ async def writer_loop() -> None:
             continue
         entries = await quick_validate(entries)
         http_entries = [p for p in entries if p.split(":", 1)[0] in {"http", "https"}]
-        other_entries = [
-            p for p in entries if p.split(":", 1)[0] not in {"http", "https"}
-        ]
+        other_entries = [p for p in entries if p.split(":", 1)[0] not in {"http", "https"}]
 
         if http_entries:
             ok_http = await filter_http_connect(http_entries)
@@ -1964,56 +1907,6 @@ async def run_filter_p2_all() -> None:
             print(f"{p};score={score}")
 
 
-async def full_validation_loop() -> None:
-    """Continuously validate all known proxies."""
-    while True:
-        await asyncio.sleep(2)
-        pending = list(proxy_set) + _load_all_saved_proxies()
-        if not pending:
-            continue
-        dedup: list[str] = []
-        seen: set[str] = set()
-        for p in pending:
-            if p not in seen:
-                seen.add(p)
-                dedup.append(p)
-
-        entries = await quick_validate(dedup)
-        if not entries:
-            continue
-
-        http_entries = [p for p in entries if p.split(":", 1)[0] in {"http", "https"}]
-        socks_entries = [
-            p for p in entries if p.split(":", 1)[0] in {"socks4", "socks5"}
-        ]
-
-        if http_entries:
-            sem = asyncio.Semaphore(POOL_LIMIT)
-
-            async def check(p: str) -> str | None:
-                async with sem:
-                    ok = await check_http_connect(p)
-                return p if ok else None
-
-            tasks = [asyncio.create_task(check(p)) for p in http_entries]
-            gathered = await asyncio.gather(*tasks, return_exceptions=True)
-            ok_http: list[str] = []
-            successes = 0
-            for res in gathered:
-                if isinstance(res, Exception):
-                    continue
-                if res:
-                    successes += 1
-                    ok_http.append(res)
-            STATS["http_connect_pass"] += successes
-            STATS["http_connect_fail"] += len(http_entries) - successes
-            await write_http_connect_entries(ok_http)
-
-        if socks_entries:
-            ok_socks = await _filter_p1_batch(socks_entries)
-            await write_p1_pass_entries(ok_socks)
-
-
 async def fetch_json(url: str) -> dict:
     """Fetch JSON from ``url`` using the configured HTTP client."""
     session = await get_aiohttp_session()
@@ -2042,10 +1935,7 @@ async def fetch_proxxy_sources() -> AsyncGenerator[List[str], None]:
         urls.extend(url_list)
 
     session = await get_aiohttp_session()
-    tasks = {
-        asyncio.create_task(session.get(url, timeout=REQUEST_TIMEOUT)): url
-        for url in urls
-    }
+    tasks = {asyncio.create_task(session.get(url, timeout=REQUEST_TIMEOUT)): url for url in urls}
     batch: List[str] = []
     for task in asyncio.as_completed(tasks):
         url = tasks[task]
@@ -2198,9 +2088,7 @@ async def fetch_with_backoff(url: str, max_retries: int = 5) -> str:
                     SOURCE_BACKOFF[url] = max(SOURCE_BACKOFF[url] - 1, 0)
                 resp.raise_for_status()
                 return resp.text
-            async with session.get(
-                url, headers=headers, timeout=REQUEST_TIMEOUT
-            ) as resp:
+            async with session.get(url, headers=headers, timeout=REQUEST_TIMEOUT) as resp:
                 if resp.status == 429:
                     SOURCE_BACKOFF[url] = min(SOURCE_BACKOFF[url] + 1, 3)
                 else:
@@ -2307,9 +2195,7 @@ async def scrape_proxyscraper_sources(interval: int = PS_INTERVAL) -> None:
         new_entries: list[str] = []
         for i in range(0, len(urls), batch):
             subset = urls[i : i + batch]
-            texts = await asyncio.gather(
-                *[loop.run_in_executor(None, _ps_get, u) for u in subset]
-            )
+            texts = await asyncio.gather(*[loop.run_in_executor(None, _ps_get, u) for u in subset])
             for url, text in zip(subset, texts):
                 proto_match = PROTO_PARAM_RE.search(url)
                 proto = proto_match.group(1).lower() if proto_match else "http"
@@ -2324,9 +2210,7 @@ async def scrape_proxyscraper_sources(interval: int = PS_INTERVAL) -> None:
         await asyncio.sleep(interval)
 
 
-async def download_proxy_list(
-    urls: list[tuple[str, str]], concurrency: int = 5
-) -> list[str]:
+async def download_proxy_list(urls: list[tuple[str, str]], concurrency: int = 5) -> list[str]:
     """Download simple text proxy lists concurrently."""
     session = await get_aiohttp_session()
     sem = asyncio.Semaphore(concurrency)
@@ -2336,9 +2220,7 @@ async def download_proxy_list(
             try:
                 async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
                     if resp.status >= 400:
-                        raise aiohttp.ClientResponseError(
-                            resp.request_info, resp.history, status=resp.status
-                        )
+                        raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
                     text = await resp.text()
                 result: list[str] = []
                 for line in text.splitlines():
@@ -2393,9 +2275,7 @@ async def scrape_pubproxy() -> None:
                 port = item.get("port")
             protocol = item.get("type", "http")
             if ip and port:
-                await add_proxies(
-                    [f"{protocol.lower()}:{ip}:{port}"], source="pubproxy"
-                )
+                await add_proxies([f"{protocol.lower()}:{ip}:{port}"], source="pubproxy")
     except Exception as e:
         logging.error("Error fetching pubproxy: %s", e)
 
@@ -2410,9 +2290,7 @@ async def scrape_proxykingdom() -> None:
         port = data.get("port")
         protocol = data.get("protocol")
         if ip and port and protocol:
-            await add_proxies(
-                [f"{protocol.lower()}:{ip}:{port}"], source="proxykingdom"
-            )
+            await add_proxies([f"{protocol.lower()}:{ip}:{port}"], source="proxykingdom")
     except Exception as e:
         logging.error("Error fetching proxykingdom: %s", e)
 
@@ -2504,9 +2382,7 @@ async def scrape_proxy_list_download() -> None:
             try:
                 async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
                     if resp.status >= 400:
-                        raise aiohttp.ClientResponseError(
-                            resp.request_info, resp.history, status=resp.status
-                        )
+                        raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
                     text = await resp.text()
                 for line in text.splitlines():
                     line = line.strip()
@@ -2582,9 +2458,7 @@ async def scrape_freeproxy_all() -> None:
         try:
             async with session.get(FREEPROXY_ALL_URL, timeout=REQUEST_TIMEOUT) as resp:
                 if resp.status >= 400:
-                    raise aiohttp.ClientResponseError(
-                        resp.request_info, resp.history, status=resp.status
-                    )
+                    raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
                 text = await resp.text()
             for line in text.splitlines():
                 line = line.strip()
@@ -2615,9 +2489,7 @@ async def scrape_kangproxy() -> None:
             try:
                 async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
                     if resp.status >= 400:
-                        raise aiohttp.ClientResponseError(
-                            resp.request_info, resp.history, status=resp.status
-                        )
+                        raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
                     text = await resp.text()
                 for line in text.splitlines():
                     line = line.strip()
@@ -2675,9 +2547,7 @@ async def scrape_spys() -> None:
             try:
                 async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
                     if resp.status >= 400:
-                        raise aiohttp.ClientResponseError(
-                            resp.request_info, resp.history, status=resp.status
-                        )
+                        raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
                     text = await resp.text()
                 for ip, port in _parse_spys_list(text):
                     proxies.append(f"{proto}:{ip}:{port}")
@@ -2700,13 +2570,9 @@ async def scrape_proxybros() -> None:
         proxies = []
         try:
             headers = {"User-Agent": random.choice(USER_AGENTS)}
-            async with session.get(
-                PROXYBROS_URL, headers=headers, timeout=REQUEST_TIMEOUT
-            ) as resp:
+            async with session.get(PROXYBROS_URL, headers=headers, timeout=REQUEST_TIMEOUT) as resp:
                 if resp.status >= 400:
-                    raise aiohttp.ClientResponseError(
-                        resp.request_info, resp.history, status=resp.status
-                    )
+                    raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
                 text = await resp.text()
 
             def _parse() -> list[str]:
@@ -2749,7 +2615,9 @@ async def scrape_bloody_proxies() -> None:
         )
         return
 
-    spec = importlib.util.spec_from_file_location("bloody_proxyscraper", module_path)
+    spec = importlib.util.spec_from_file_location(
+        "bloody_proxyscraper", module_path
+    )
     loader = spec.loader if spec else None
     if not spec or loader is None:
         logging.error("Unable to load Bloody-Proxy-Scraper module")
@@ -3221,38 +3089,19 @@ async def main() -> None:
         tg.create_task(run_periodic(monitor_paste_feeds, SCRAPERS["paste"], "paste"))
         tg.create_task(run_periodic(scrape_tor_relays, SCRAPERS["tor"], "tor"))
         tg.create_task(monitor_irc_channels())
-        tg.create_task(
-            run_periodic(scrape_proxyscrape, SCRAPERS["proxyscrape"], "proxyscrape")
-        )
-        tg.create_task(
-            run_periodic(scrape_gimmeproxy, SCRAPERS["gimmeproxy"], "gimmeproxy")
-        )
+        tg.create_task(run_periodic(scrape_proxyscrape, SCRAPERS["proxyscrape"], "proxyscrape"))
+        tg.create_task(run_periodic(scrape_gimmeproxy, SCRAPERS["gimmeproxy"], "gimmeproxy"))
         tg.create_task(run_periodic(scrape_pubproxy, SCRAPERS["pubproxy"], "pubproxy"))
-        tg.create_task(
-            run_periodic(scrape_proxykingdom, SCRAPERS["proxykingdom"], "proxykingdom")
-        )
+        tg.create_task(run_periodic(scrape_proxykingdom, SCRAPERS["proxykingdom"], "proxykingdom"))
         tg.create_task(run_periodic(scrape_geonode, SCRAPERS["geonode"], "geonode"))
-        tg.create_task(
-            run_periodic(scrape_proxyspace, SCRAPERS["proxyspace"], "proxyspace")
-        )
-        tg.create_task(
-            run_periodic(
-                scrape_proxy_list_sites,
-                SCRAPERS["proxy_list_sites"],
-                "proxy_list_sites",
-            )
-        )
+        tg.create_task(run_periodic(scrape_proxyspace, SCRAPERS["proxyspace"], "proxyspace"))
+        tg.create_task(run_periodic(scrape_proxy_list_sites, SCRAPERS["proxy_list_sites"], "proxy_list_sites"))
         tg.create_task(writer_loop())
-        tg.create_task(full_validation_loop())
         tg.create_task(stats_loop())
         tg.create_task(run_proxxy())
         tg.create_task(scrape_proxyhub(PROXYHUB_INTERVAL, PROXYHUB_CONCURRENCY))
-        tg.create_task(
-            scrape_gatherproxy(GATHER_PROXY_INTERVAL, GATHER_PROXY_CONCURRENCY)
-        )
-        tg.create_task(
-            scrape_openproxylist(OPENPROXYLIST_INTERVAL, OPENPROXYLIST_CONCURRENCY)
-        )
+        tg.create_task(scrape_gatherproxy(GATHER_PROXY_INTERVAL, GATHER_PROXY_CONCURRENCY))
+        tg.create_task(scrape_openproxylist(OPENPROXYLIST_INTERVAL, OPENPROXYLIST_CONCURRENCY))
         tg.create_task(scrape_proxyscraper_sources())
         tg.create_task(scrape_proxy_list_download())
         tg.create_task(scrape_freeproxy())
@@ -3265,7 +3114,6 @@ async def main() -> None:
         tg.create_task(scrape_bloody_proxies())
     for p in procs:
         p.terminate()
-
 
 if __name__ == "__main__":
     import sys
@@ -3284,7 +3132,6 @@ if __name__ == "__main__":
 
     if len(sys.argv) >= 2 and sys.argv[1] == "filter_p2":
         import asyncio
-
         if len(sys.argv) == 3:
             proxy = sys.argv[2]
 
@@ -3296,7 +3143,9 @@ if __name__ == "__main__":
                 if not res:
                     return 1
                 p, total, parts = res
-                print(f"{p} score={total} ip={parts['ip']} tls={parts['tls']}")
+                print(
+                    f"{p} score={total} ip={parts['ip']} tls={parts['tls']}"
+                )
                 return 0
 
             sys.exit(asyncio.run(_run()))

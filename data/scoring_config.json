@@ -1,35 +1,19 @@
 {
   "mode": "strict",
   "strict": {
-    "CRITICAL_MIN": 325,
-    "OVERALL_MIN": 700,
+    "CRITICAL_MIN": 120,
+    "OVERALL_MIN": 250,
     "WEIGHTS": {
       "ip_rep": 179,
-      "proxy_type": 152,
-      "tls_reach": 152,
-      "ja3": 124,
-      "fresh": 83,
-      "nettype": 83,
-      "asn": 83,
-      "err_rate": 48,
-      "geo": 48,
-      "latency": 48
+      "tls_reach": 152
     }
   },
   "lenient": {
-    "CRITICAL_MIN": 300,
-    "OVERALL_MIN": 600,
+    "CRITICAL_MIN": 100,
+    "OVERALL_MIN": 200,
     "WEIGHTS": {
       "ip_rep": 120,
-      "proxy_type": 152,
-      "tls_reach": 152,
-      "ja3": 80,
-      "fresh": 83,
-      "nettype": 83,
-      "asn": 83,
-      "err_rate": 48,
-      "geo": 24,
-      "latency": 24
+      "tls_reach": 152
     }
   }
 }

@@ -393,18 +393,10 @@ PROTOCOL_RE = re.compile(r"^(https?|socks4|socks5)$", re.I)
 # Scoring weights and thresholds for filter_p2
 WEIGHTS = {
     "ip_rep": 179,
-    "proxy_type": 152,
     "tls_reach": 152,
-    "ja3": 124,
-    "fresh": 83,
-    "nettype": 83,
-    "asn": 83,
-    "err_rate": 48,
-    "geo": 48,
-    "latency": 48,
 }
-CRITICAL_MIN = 325
-OVERALL_MIN = 700
+CRITICAL_MIN = 120
+OVERALL_MIN = 250
 
 # Optional scoring configuration loaded from JSON/YAML
 MODE = "strict"
@@ -756,7 +748,6 @@ async def measure_latency(ip: str, port: int, proto: str) -> float | None:
         await writer.wait_closed()
         record_attempt(ip, True)
         _latency_cache[key] = (latency_ms, now)
-        STATS["latency_samples"].append(latency_ms)
         STATS["tls_success"] += 1
         return latency_ms
     except Exception:
@@ -813,7 +804,6 @@ async def _tls_factor(ip: str, port: int, ctx: ssl.SSLContext) -> float:
             await writer.wait_closed()
             _latency_cache[key] = (latency_ms, now)
             record_attempt(ip, True)
-            STATS["latency_samples"].append(latency_ms)
             STATS["tls_success"] += 1
             if cipher and cipher[0] != "NULL":
                 val = 1.0
@@ -998,11 +988,6 @@ STATS: dict[str, Any] = {
     "filter_p2_pass": 0,
     "filter_p2_fail": 0,
     "score_samples": [],
-    "latency_samples": [],
-    "network_class": defaultdict(int),
-    "country_counts": defaultdict(int),
-    "asn_counts": defaultdict(int),
-    "bad_ja3": 0,
     "tls_success": 0,
     "tls_fail": 0,
     "written_per_proto": defaultdict(int),
@@ -1064,12 +1049,6 @@ def _stats_snapshot() -> dict[str, Any]:
     snap["quick_validate_rate"] = (
         snap["quick_validate_pass"] / total_qv if total_qv else 0.0
     )
-    if STATS["latency_samples"]:
-        snap["latency_avg"] = mean(STATS["latency_samples"])
-        snap["latency_min"] = min(STATS["latency_samples"])
-        snap["latency_max"] = max(STATS["latency_samples"])
-    else:
-        snap["latency_avg"] = snap["latency_min"] = snap["latency_max"] = 0.0
     if STATS["score_samples"]:
         snap["score_min"] = min(STATS["score_samples"])
         snap["score_median"] = median(STATS["score_samples"])
@@ -1592,15 +1571,6 @@ async def _score_single_proxy(
         norm, total = result[0], result[1]
         extra = result[2] if len(result) > 2 else {}
         STATS["score_samples"].append(total)
-        lat = extra.get("lat") or extra.get("latency")
-        if lat is not None:
-            STATS["latency_samples"].append(lat)
-        if "country" in extra:
-            STATS["country_counts"][extra["country"]] += 1
-        if "netclass" in extra:
-            STATS["network_class"][extra["netclass"]] += 1
-        if "asn" in extra:
-            STATS["asn_counts"][extra["asn"]] += 1
         return norm, total, extra
     norm = normalize_proxy(p)
     if not norm:
@@ -1614,11 +1584,7 @@ async def _score_single_proxy(
         update_freshness(proxy_id, False)
         return None
 
-    if proto in ("socks5", "https"):
-        type_factor = 1.0
-    elif proto == "socks4":
-        type_factor = 0.5
-    else:
+    if proto not in ("socks4", "socks5", "https"):
         update_freshness(proxy_id, False)
         return None
 
@@ -1627,89 +1593,10 @@ async def _score_single_proxy(
         update_freshness(proxy_id, False)
         return None
 
-    critical_score = (
-        ip_factor * WEIGHTS["ip_rep"]
-        + type_factor * WEIGHTS["proxy_type"]
-        + tls_factor * WEIGHTS["tls_reach"]
-    )
-
-    ja3 = await get_ja3(norm)
-    ja3_factor = 0.0 if ja3 and ja3 in KNOWN_BAD_JA3 else 1.0
-
-    fresh_val = get_freshness(proxy_id)
-    if fresh_val >= 0.8:
-        fresh_factor = 1.0
-    elif fresh_val <= 0.2:
-        fresh_factor = 0.0
-    else:
-        fresh_factor = 0.5
-
-    asn = 0
-    netclass = classify_asn(asn)
-    if netclass in ("res", "mob"):
-        net_factor = 1.0
-    elif netclass == "mixed":
-        net_factor = 0.5
-    else:
-        net_factor = 0.0
-
-    if ALLOWED_ASNS and asn not in ALLOWED_ASNS:
-        asn_factor = 0.0
-    elif asn in CLOUD_ASNS:
-        asn_factor = 0.0
-    elif ASN_TYPE.get(asn, "").lower().startswith("grey"):
-        asn_factor = 0.5
-    else:
-        asn_factor = 1.0
-
-    ja3_points = int(ja3_factor * WEIGHTS["ja3"])
-    fresh_points = int(fresh_factor * WEIGHTS["fresh"])
-    net_points = int(net_factor * WEIGHTS["nettype"])
-    asn_points = int(asn_factor * WEIGHTS["asn"])
-
-    country = geo_lookup(ip)
-    if country is None:
-        logging.debug("Geo lookup failed for %s", ip)
-    if ALLOWED_COUNTRIES and country not in ALLOWED_COUNTRIES:
-        geo_factor = 0.0
-    elif country in ALLOWED_COUNTRIES:
-        geo_factor = 1.0
-    elif country in EU_COUNTRIES:
-        geo_factor = 0.5
-    else:
-        geo_factor = 0.0
-    geo_points = int(geo_factor * WEIGHTS["geo"])
-
-    err_rate = calc_err_rate(ip)
-    if err_rate < 0.01:
-        err_factor = 1.0
-    elif err_rate <= 0.05:
-        err_factor = 0.5
-    else:
-        err_factor = 0.0
-    err_points = int(err_factor * WEIGHTS["err_rate"])
-
-    latency = await measure_latency(ip, int(port), proto)
-    if latency is None:
-        lat_factor = 0.0
-    elif 20 <= latency <= 150:
-        lat_factor = 1.0
-    elif latency <= 350:
-        lat_factor = 0.5
-    else:
-        lat_factor = 0.0
-    lat_points = int(lat_factor * WEIGHTS["latency"])
-
-    total_score = int(
-        critical_score
-        + ja3_points
-        + fresh_points
-        + net_points
-        + asn_points
-        + err_points
-        + geo_points
-        + lat_points
-    )
+    ip_points = int(ip_factor * WEIGHTS["ip_rep"])
+    tls_points = int(tls_factor * WEIGHTS["tls_reach"])
+    critical_score = ip_points + tls_points
+    total_score = critical_score
 
     passed = total_score >= OVERALL_MIN and critical_score >= CRITICAL_MIN
     update_freshness(proxy_id, passed)
@@ -1718,25 +1605,11 @@ async def _score_single_proxy(
 
     if passed:
         STATS["score_samples"].append(total_score)
-        STATS["network_class"][netclass] += 1
-        if country:
-            STATS["country_counts"][country] += 1
-        STATS["asn_counts"][asn] += 1
-        if ja3 and ja3 in KNOWN_BAD_JA3:
-            STATS["bad_ja3"] += 1
 
     scores = {
-        "ip": int(ip_factor * WEIGHTS["ip_rep"]),
-        "proto": int(type_factor * WEIGHTS["proxy_type"]),
-        "tls": int(tls_factor * WEIGHTS["tls_reach"]),
-        "ja3": ja3_points,
-        "fresh": fresh_points,
-        "net": net_points,
-        "asn": asn_points,
-        "err": err_points,
-        "geo": geo_points,
-        "lat": lat_points,
-        "critical": int(critical_score),
+        "ip": ip_points,
+        "tls": tls_points,
+        "critical": critical_score,
     }
     return norm, total_score, scores
 
@@ -1759,10 +1632,6 @@ async def filter_p2(
         return [], []
 
     await load_blacklists()
-    await load_ja3_sets()
-    await load_asn_metadata()
-    await load_geoip()
-    load_allow_lists()
     ctx = ssl.create_default_context()
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
@@ -3169,17 +3038,12 @@ if __name__ == "__main__":
                 ctx = ssl.create_default_context()
                 ctx.minimum_version = ssl.TLSVersion.TLSv1_2
                 await load_blacklists()
-                await load_ja3_sets()
-                await load_asn_metadata()
-                await load_geoip()
                 res = await _score_single_proxy(proxy, ctx, return_all=True)
                 if not res:
                     return 1
                 p, total, parts = res
                 print(
-                    f"{p} score={total} ip={parts['ip']} proto={parts['proto']} tls={parts['tls']} "
-                    f"ja3={parts['ja3']} fresh={parts['fresh']} net={parts['net']} asn={parts['asn']} "
-                    f"err={parts['err']} geo={parts['geo']} lat={parts['lat']}"
+                    f"{p} score={total} ip={parts['ip']} tls={parts['tls']}"
                 )
                 return 0
 

@@ -1,0 +1,14 @@
+{
+  "mode": "strict",
+  "lenient": {
+    "CRITICAL_MIN": 300,
+    "OVERALL_MIN": 600,
+    "QUARANTINE_MIN": 500,
+    "WEIGHTS": {
+      "geo": 24,
+      "latency": 24,
+      "ja3": 80,
+      "ip_rep": 120
+    }
+  }
+}

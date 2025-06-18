@@ -405,6 +405,8 @@ WEIGHTS = {
 }
 CRITICAL_MIN = 325
 OVERALL_MIN = 700
+MODE = "strict"
+QUARANTINE_MIN = OVERALL_MIN
 
 # JA3 / ASN data and history tracking
 JA3_CACHE_TTL = 1800  # seconds
@@ -641,6 +643,47 @@ def load_allow_lists(path: str | None = None) -> None:
         ALLOWED_ASNS = tmp
 
 load_allow_lists()
+
+
+def load_scoring_config(path: str | None = None) -> None:
+    """Load scoring mode and weights from a JSON or YAML file."""
+    global MODE, WEIGHTS, CRITICAL_MIN, OVERALL_MIN, QUARANTINE_MIN
+    file_path = path or os.getenv("SCORE_CONFIG_FILE", "score_config.json")
+    if not os.path.exists(file_path):
+        return
+    try:
+        with open(file_path, "r") as f:
+            if file_path.endswith((".yml", ".yaml")):
+                try:
+                    import yaml  # type: ignore
+                except Exception:
+                    cfg = json.load(f)
+                else:
+                    cfg = yaml.safe_load(f)
+            else:
+                cfg = json.load(f)
+    except Exception as exc:  # pragma: no cover - ignore invalid config
+        logging.error("Error loading scoring config %s: %s", file_path, exc)
+        return
+    mode = str(cfg.get("mode", MODE)).lower()
+    MODE = mode
+    mode_cfg = cfg.get(mode, {})
+    weights = mode_cfg.get("WEIGHTS") or mode_cfg.get("weights")
+    if isinstance(weights, dict):
+        for k, v in weights.items():
+            if k in WEIGHTS:
+                try:
+                    WEIGHTS[k] = int(v)
+                except Exception:
+                    continue
+    CRITICAL_MIN = int(mode_cfg.get("CRITICAL_MIN", CRITICAL_MIN))
+    OVERALL_MIN = int(mode_cfg.get("OVERALL_MIN", OVERALL_MIN))
+    QUARANTINE_MIN = int(mode_cfg.get("QUARANTINE_MIN", OVERALL_MIN))
+    if MODE == "strict":
+        QUARANTINE_MIN = OVERALL_MIN
+
+
+load_scoring_config()
 
 
 def geo_lookup(ip: str) -> str | None:
@@ -1658,11 +1701,11 @@ async def _score_single_proxy(p: str, ctx: ssl.SSLContext) -> tuple[str, int, di
         + lat_points
     )
 
-    if total_score < OVERALL_MIN or critical_score < CRITICAL_MIN:
+    if total_score < QUARANTINE_MIN or critical_score < CRITICAL_MIN:
         update_freshness(proxy_id, False)
         return None
 
-    update_freshness(proxy_id, True)
+    update_freshness(proxy_id, total_score >= OVERALL_MIN)
     STATS["score_samples"].append(total_score)
     STATS["network_class"][netclass] += 1
     if country:
@@ -1685,8 +1728,13 @@ async def _score_single_proxy(p: str, ctx: ssl.SSLContext) -> tuple[str, int, di
     return norm, total_score, scores
 
 
-async def filter_p2(proxies: list[str]) -> list[tuple[str, int]]:
-    """Score proxies with multiple heuristics."""
+async def filter_p2(proxies: list[str]) -> tuple[list[tuple[str, int]], list[tuple[str, int]]]:
+    """Score proxies with multiple heuristics.
+
+    Returns a tuple ``(approved, quarantine)`` where ``approved`` contains
+    proxies scoring at least ``OVERALL_MIN`` and ``quarantine`` holds those
+    scoring between ``QUARANTINE_MIN`` and ``OVERALL_MIN``.
+    """
 
     proxies = [
         p
@@ -1694,7 +1742,7 @@ async def filter_p2(proxies: list[str]) -> list[tuple[str, int]]:
         if p.split(":", 1)[0].lower() in {"socks4", "socks5"}
     ]
     if not proxies:
-        return []
+        return [], []
 
     await load_blacklists()
     await load_ja3_sets()
@@ -1712,16 +1760,20 @@ async def filter_p2(proxies: list[str]) -> list[tuple[str, int]]:
 
     tasks = [asyncio.create_task(score(p)) for p in proxies]
     results: list[tuple[str, int]] = []
+    quarantine: list[tuple[str, int]] = []
     for t in asyncio.as_completed(tasks):
         try:
             res = await t
             if res:
-                results.append(res)
+                if res[1] >= OVERALL_MIN:
+                    results.append(res)
+                else:
+                    quarantine.append(res)
         except Exception:
             continue
     STATS["filter_p2_pass"] += len(results)
-    STATS["filter_p2_fail"] += len(proxies) - len(results)
-    return results
+    STATS["filter_p2_fail"] += len(proxies) - len(results) - len(quarantine)
+    return results, quarantine
 
 
 
@@ -1804,7 +1856,7 @@ async def writer_loop() -> None:
             continue
         entries = await quick_validate(entries)
         entries = await _filter_p1_batch(entries)
-        entries_with_scores = await filter_p2(entries)
+        entries_with_scores, _ = await filter_p2(entries)
         score_map = {p: s for p, s in entries_with_scores}
         entries = await filter_working(list(score_map.keys()))
         entries, port_map = await filter_libero_ports(entries)
@@ -1857,9 +1909,13 @@ async def run_filter_p2_all() -> None:
             proxies.append(new_entries.get_nowait())
         except asyncio.QueueEmpty:
             break
-    results = await filter_p2(proxies)
+    results, quarantine = await filter_p2(proxies)
     for p, score in results:
         print(f"{p};score={score}")
+    if quarantine:
+        print("# quarantine")
+        for p, score in quarantine:
+            print(f"{p};score={score}")
 
 
 async def fetch_json(url: str) -> dict:
@@ -3106,7 +3162,7 @@ if __name__ == "__main__":
                     f"ja3={parts['ja3']} fresh={parts['fresh']} net={parts['net']} asn={parts['asn']} "
                     f"err={parts['err']} geo={parts['geo']} lat={parts['lat']}"
                 )
-                return 0
+                return 0 if total >= OVERALL_MIN else 1
 
             sys.exit(asyncio.run(_run()))
         else:

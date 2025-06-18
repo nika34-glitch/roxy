@@ -8,6 +8,7 @@ import socket
 from typing import Dict, List
 from bs4 import BeautifulSoup
 from pybloom_live import ScalableBloomFilter
+from scrape_proxies import filter_p1, filter_p2, load_blacklists
 
 try:
     import uvloop  # type: ignore
@@ -19,9 +20,9 @@ OUTPUT_COMPRESSED = os.getenv("OUTPUT_COMPRESSED", "0") == "1"
 CHECK_CONNECT = os.getenv("CHECK_CONNECT", "0") == "1"
 OUT_PATH = "p1_pass.txt" + (".gz" if OUTPUT_COMPRESSED else "")
 
-POOL_LIMIT_MIN = 50
-POOL_LIMIT_MAX = 800
-POOL_LIMIT = 300
+POOL_LIMIT_MIN = 8_000
+POOL_LIMIT_MAX = 14_000
+POOL_LIMIT = 12_000
 _sem = asyncio.Semaphore(POOL_LIMIT)
 _connector = aiohttp.TCPConnector(limit=POOL_LIMIT)
 _session: aiohttp.ClientSession | None = None
@@ -30,6 +31,13 @@ _last_fetch: Dict[str, float] = {}
 _bloom = ScalableBloomFilter(mode=ScalableBloomFilter.SMALL_SET_GROWTH)
 _success = 0
 _checked = 0
+STATS = {
+    "proxies_gotten": 0,
+    "validated": 0,
+    "p1_pass": 0,
+    "p2_pass": 0,
+    "p1_p2_fail": 0,
+}
 
 SOURCES = {
     "http_github": {
@@ -62,15 +70,16 @@ def parse_proxies(text: str) -> List[str]:
     lines = [l.strip() for l in text.splitlines() if l.strip()]
     proxies = []
     for line in lines:
-        if line.startswith("http://") or line.startswith("https://") or line.startswith("socks"):
+        if "://" in line:
             proto, rest = line.split("://", 1)
-            ip_port = rest
         else:
-            proto = "http"
-            ip_port = line
-        if ":" not in ip_port:
+            proto, rest = "http", line
+        if ":" not in rest:
             continue
-        ip, port = ip_port.split(":", 1)
+        ip, port = rest.split(":", 1)
+        proto = proto.lower()
+        if proto not in {"socks4", "socks5"}:
+            continue
         proxies.append(f"{proto}://{ip}:{port}")
     return proxies
 
@@ -89,7 +98,9 @@ async def fetch_source(name: str, cfg: Dict[str, str | int]) -> List[str]:
     async with _sem:
         async with _session.get(url, timeout=10) as resp:
             text = await resp.text()
-    return parse_proxies(text)
+    proxies = parse_proxies(text)
+    STATS["proxies_gotten"] += len(proxies)
+    return proxies
 
 
 async def quick_tcp_connect(ip: str, port: int, timeout: float = 3.0) -> bool:
@@ -129,21 +140,41 @@ async def validate_proxy(proxy: str, out_f) -> None:
     if proxy in _bloom:
         return
     _bloom.add(proxy)
+
     proto, ip, port = proxy.split(":")
     port = int(port)
+    if proto not in {"socks4", "socks5"}:
+        return
+
     ok = await quick_tcp_connect(ip, port)
     if ok and CHECK_CONNECT:
         ok = await http_connect_check(f"{proto}:{ip}:{port}")
+    if not ok:
+        _checked += 1
+        if _checked % 50 == 0:
+            rate = _success / max(1, _checked)
+            await adjust_pool_limit(rate)
+        return
     _checked += 1
-    if ok:
-        _success += 1
-        line = f"{proto}://{ip}:{port}\n"
-        if OUTPUT_COMPRESSED:
-            await asyncio.to_thread(out_f.write, line)
-            await asyncio.to_thread(out_f.flush)
+    _success += 1
+    STATS["validated"] += 1
+
+    if not await asyncio.to_thread(filter_p1, f"{proto}://{ip}:{port}", "pop3"):
+        STATS["p1_p2_fail"] += 1
+    else:
+        STATS["p1_pass"] += 1
+        accepted, _ = await filter_p2([f"{proto}:{ip}:{port}"])
+        if accepted:
+            STATS["p2_pass"] += 1
+            line = f"{proto}://{ip}:{port}\n"
+            if OUTPUT_COMPRESSED:
+                await asyncio.to_thread(out_f.write, line)
+                await asyncio.to_thread(out_f.flush)
+            else:
+                await out_f.write(line)
+                await out_f.flush()
         else:
-            await out_f.write(line)
-            await out_f.flush()
+            STATS["p1_p2_fail"] += 1
 
     if _checked % 50 == 0:
         rate = _success / max(1, _checked)
@@ -159,7 +190,22 @@ async def worker(queue: asyncio.Queue, out_f) -> None:
             queue.task_done()
 
 
+async def stats_loop() -> None:
+    while True:
+        await asyncio.sleep(1)
+        msg = (
+            f"got={STATS['proxies_gotten']} "
+            f"validated={STATS['validated']} "
+            f"p1_pass={STATS['p1_pass']} "
+            f"p2_pass={STATS['p2_pass']} "
+            f"fail={STATS['p1_p2_fail']} "
+            f"pool={POOL_LIMIT}"
+        )
+        print(msg, end="\r", flush=True)
+
+
 async def main() -> None:
+    await load_blacklists()
     queue: asyncio.Queue[str] = asyncio.Queue()
     tasks = []
     if OUTPUT_COMPRESSED:
@@ -168,6 +214,7 @@ async def main() -> None:
         out_f = await aiofiles.open(OUT_PATH, "a", buffering=1)
     for _ in range(POOL_LIMIT):
         tasks.append(asyncio.create_task(worker(queue, out_f)))
+    stats_task = asyncio.create_task(stats_loop())
 
     async def produce(name: str, cfg: Dict[str, str | int]):
         while True:
@@ -179,7 +226,7 @@ async def main() -> None:
                 pass
 
     prod_tasks = [asyncio.create_task(produce(n, c)) for n, c in SOURCES.items()]
-    await asyncio.gather(*prod_tasks)
+    await asyncio.gather(*prod_tasks, stats_task)
 
 
 if __name__ == "__main__":

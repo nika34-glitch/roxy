@@ -15,3 +15,12 @@ The script writes statistics to `stats.json` every second when running. Ensure
 `BeautifulSoup` and either `lxml` or Python's builtin HTML parser are
 available.
 
+## Quick SOCKS scraper
+
+`optional_socks_scraper.py` collects only SOCKS4 and SOCKS5 proxies for five
+minutes and stores the working ones in `~/Desktop/last.txt`. Run it as:
+
+```bash
+python optional_socks_scraper.py --optionals
+```
+

@@ -24,7 +24,7 @@ POOL_LIMIT_MIN = 8_000
 POOL_LIMIT_MAX = 14_000
 POOL_LIMIT = 12_000
 _sem = asyncio.Semaphore(POOL_LIMIT)
-_connector = aiohttp.TCPConnector(limit=POOL_LIMIT)
+_connector: aiohttp.TCPConnector | None = None
 _session: aiohttp.ClientSession | None = None
 
 _last_fetch: Dict[str, float] = {}
@@ -93,6 +93,8 @@ async def fetch_source(name: str, cfg: Dict[str, str | int]) -> List[str]:
         await asyncio.sleep(cooldown - (now - last))
     _last_fetch[name] = time.monotonic()
     if _session is None:
+        if _connector is None:
+            _connector = aiohttp.TCPConnector(limit=POOL_LIMIT)
         _session = aiohttp.ClientSession(connector=_connector)
     url = cfg["url"]
     async with _sem:
@@ -205,7 +207,10 @@ async def stats_loop() -> None:
 
 
 async def main() -> None:
+    global _connector, _session
     await load_blacklists()
+    _connector = aiohttp.TCPConnector(limit=POOL_LIMIT)
+    _session = aiohttp.ClientSession(connector=_connector)
     queue: asyncio.Queue[str] = asyncio.Queue()
     tasks = []
     if OUTPUT_COMPRESSED:

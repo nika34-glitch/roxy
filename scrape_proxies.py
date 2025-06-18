@@ -987,6 +987,8 @@ STATS: dict[str, Any] = {
     "filter_p1_fail": 0,
     "filter_p2_pass": 0,
     "filter_p2_fail": 0,
+    "http_connect_pass": 0,
+    "http_connect_fail": 0,
     "score_samples": [],
     "tls_success": 0,
     "tls_fail": 0,
@@ -1048,6 +1050,10 @@ def _stats_snapshot() -> dict[str, Any]:
     total_qv = snap["quick_validate_pass"] + snap["quick_validate_fail"]
     snap["quick_validate_rate"] = (
         snap["quick_validate_pass"] / total_qv if total_qv else 0.0
+    )
+    total_http = snap.get("http_connect_pass", 0) + snap.get("http_connect_fail", 0)
+    snap["http_connect_rate"] = (
+        snap.get("http_connect_pass", 0) / total_http if total_http else 0.0
     )
     if STATS["score_samples"]:
         snap["score_min"] = min(STATS["score_samples"])
@@ -1462,6 +1468,90 @@ def _write_gzip(path: str, items: list[str], mode: str) -> None:
             f.write("".join(buf).encode())
 
 
+async def check_http_connect(proxy: str, host: str = "example.com", port: int = 443) -> bool:
+    """Return True if an HTTP proxy supports the CONNECT method."""
+    proto, ip, p = proxy.split(":")
+    if proto not in {"http", "https"}:
+        return False
+    try:
+        reader, writer = await asyncio.wait_for(
+            asyncio.open_connection(ip, int(p)), timeout=CONNECT_TIMEOUT
+        )
+    except Exception:
+        return False
+    try:
+        req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n\r\n"
+        writer.write(req.encode())
+        await writer.drain()
+        resp = await asyncio.wait_for(reader.read(1024), timeout=CONNECT_TIMEOUT)
+        return b"200" in resp
+    except Exception:
+        return False
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def filter_http_connect(proxies: list[str]) -> list[str]:
+    """Filter HTTP proxies that support CONNECT."""
+    http_proxies = [p for p in proxies if p.split(":", 1)[0] in {"http", "https"}]
+    if not http_proxies:
+        return []
+    sem = asyncio.Semaphore(POOL_LIMIT)
+
+    async def check(p: str) -> str | None:
+        async with sem:
+            ok = await check_http_connect(p)
+        return p if ok else None
+
+    tasks = [asyncio.create_task(check(p)) for p in http_proxies]
+    gathered = await asyncio.gather(*tasks, return_exceptions=True)
+    keep: list[str] = []
+    successes = 0
+    for res in gathered:
+        if isinstance(res, Exception):
+            continue
+        if res:
+            successes += 1
+            keep.append(res)
+    STATS["http_connect_pass"] += successes
+    STATS["http_connect_fail"] += len(http_proxies) - successes
+    return keep
+
+
+async def write_http_connect_entries(entries: list[str]) -> None:
+    """Append CONNECT-capable proxies to ``http_connect_method.txt``."""
+    if not entries:
+        return
+    path = os.path.join(OUTPUT_DIR, "http_connect_method.txt")
+    mode = "at" if OUTPUT_COMPRESSED else "a"
+    if OUTPUT_COMPRESSED:
+        await asyncio.to_thread(_write_gzip, path, entries, mode)
+        return
+    f = _open_files.get(path)
+    if f is None:
+        f = await aiofiles.open(path, mode)
+        _open_files[path] = f
+
+    buf: list[str] = []
+    size = 0
+    for line in entries:
+        line = line + "\n"
+        buf.append(line)
+        size += len(line)
+        if size >= 65536:
+            await f.writelines(buf)
+            await f.flush()
+            buf = []
+            size = 0
+    if buf:
+        await f.writelines(buf)
+        await f.flush()
+
+
 def filter_p1(proxy_url: str, service_name: str) -> bool:
     """Validate TCP and TLS connectivity for a service via optional proxy.
 
@@ -1743,6 +1833,17 @@ async def writer_loop() -> None:
         if not entries:
             continue
         entries = await quick_validate(entries)
+        http_entries = [p for p in entries if p.split(":", 1)[0] in {"http", "https"}]
+        other_entries = [p for p in entries if p.split(":", 1)[0] not in {"http", "https"}]
+
+        if http_entries:
+            ok_http = await filter_http_connect(http_entries)
+            await write_http_connect_entries(ok_http)
+
+        entries = other_entries
+        if not entries:
+            continue
+
         entries = await _filter_p1_batch(entries)
         good, _ = await filter_p2(entries)
         score_map = {p: s for p, s in good}

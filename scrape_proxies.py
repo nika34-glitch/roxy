@@ -38,6 +38,7 @@ except Exception:  # pragma: no cover - optional dependency
 import logging
 import ipaddress
 import itertools
+import math
 import aiofiles
 
 # Older versions of ``aiofiles`` may not expose a ``BaseFile`` class.  This
@@ -408,6 +409,9 @@ OVERALL_MIN = 700
 # JA3 / ASN data and history tracking
 JA3_CACHE_TTL = 1800  # seconds
 _ja3_cache: dict[str, tuple[str | None, float]] = {}
+# Freshness tracking per proxy URL with EWMA
+FRESH_HISTORY: dict[str, tuple[float, float]] = {}
+FRESH_HALF_LIFE = 6 * 3600  # 6 hours
 HISTORY: dict[str, tuple[float, int]] = {}
 KNOWN_BAD_JA3: set[str] = set()
 ASN_TYPE: dict[int, str] = {}
@@ -416,7 +420,13 @@ CLOUD_ASNS: set[int] = set()
 # GeoIP / error rate tracking
 GEO_DATA: list[tuple[int, int, str]] = []
 _geo_loaded = False
-ALLOWED_COUNTRIES = {"IT"}
+# Allow-lists loaded from JSON
+ALLOWLIST_FILE = os.getenv(
+    "ALLOWLIST_FILE",
+    str(Path(__file__).resolve().parent / "data" / "allow_lists.json"),
+)
+ALLOWED_COUNTRIES: set[str] = {"IT"}
+ALLOWED_ASNS: set[int] = set()
 EU_COUNTRIES = {
     "AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU",
     "IE","IT","LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE"
@@ -606,6 +616,31 @@ async def load_geoip() -> None:
     rows.sort(key=lambda r: r[0])
     GEO_DATA = rows
     _geo_loaded = True
+
+
+def load_allow_lists(path: str | None = None) -> None:
+    """Load country and ASN allow-lists from JSON file."""
+    global ALLOWED_COUNTRIES, ALLOWED_ASNS
+    file_path = path or ALLOWLIST_FILE
+    try:
+        with open(file_path, "r") as f:
+            data = json.load(f)
+    except Exception:
+        return
+    countries = data.get("countries")
+    if isinstance(countries, list):
+        ALLOWED_COUNTRIES = {str(c).upper() for c in countries}
+    asns = data.get("asns")
+    if isinstance(asns, list):
+        tmp = set()
+        for a in asns:
+            try:
+                tmp.add(int(a))
+            except Exception:
+                continue
+        ALLOWED_ASNS = tmp
+
+load_allow_lists()
 
 
 def geo_lookup(ip: str) -> str | None:
@@ -800,6 +835,23 @@ def update_ip_history(ip: str, success: bool) -> tuple[int, int]:
     return age_hours, fails
 
 
+def update_freshness(proxy_id: str, success: bool) -> float:
+    """Update EWMA freshness value for the proxy and return it."""
+    now = time.time()
+    val, ts = FRESH_HISTORY.get(proxy_id, (1.0, now))
+    decay = math.exp(-(now - ts) / FRESH_HALF_LIFE)
+    val = val * decay + (1.0 if success else 0.0) * (1 - decay)
+    FRESH_HISTORY[proxy_id] = (val, now)
+    return val
+
+
+def get_freshness(proxy_id: str) -> float:
+    now = time.time()
+    val, ts = FRESH_HISTORY.get(proxy_id, (1.0, now))
+    decay = math.exp(-(now - ts) / FRESH_HALF_LIFE)
+    return val * decay + (1.0 * (1 - decay))
+
+
 
 @lru_cache(maxsize=100000)
 def normalize_proxy(entry: str) -> str | None:
@@ -878,6 +930,7 @@ USER_AGENTS = [
 
 proxy_check_time: dict[str, float] = {}
 proxy_latency: dict[str, float] = {}
+PROXY_ID_MAP: dict[str, str] = {}
 
 # --- scraping statistics ---------------------------------------------------
 from collections import defaultdict
@@ -1402,61 +1455,80 @@ def filter_p1(proxy_url: str, service_name: str) -> bool:
 
     host, port = "pop.libero.it", 995
 
-    original_socket = socket.socket
-    if proxy_url.lower() != "none":
-        from urllib.parse import urlparse
-        import socks
+    retries = 2
+    backoff = [0.5, 1.0]
+    for attempt in range(retries + 1):
+        original_socket = socket.socket
+        if proxy_url.lower() != "none":
+            from urllib.parse import urlparse
+            import socks
 
-        parsed = urlparse(proxy_url)
-        scheme = (parsed.scheme or "socks5").lower()
-        proxy_host = parsed.hostname
-        proxy_port = parsed.port
-        username = parsed.username
-        password = parsed.password
+            parsed = urlparse(proxy_url)
+            scheme = (parsed.scheme or "socks5").lower()
+            proxy_host = parsed.hostname
+            proxy_port = parsed.port
+            username = parsed.username
+            password = parsed.password
 
-        if not proxy_host or not proxy_port:
-            print("Invalid proxy URL")
+            if not proxy_host or not proxy_port:
+                socket.socket = original_socket
+                return False
+
+            if scheme.startswith("socks5"):
+                proxy_type = socks.SOCKS5
+            elif scheme.startswith("socks4"):
+                proxy_type = socks.SOCKS4
+            elif scheme in ("http", "https"):
+                proxy_type = socks.HTTP
+            else:
+                socket.socket = original_socket
+                return False
+
+            socks.set_default_proxy(
+                proxy_type, proxy_host, proxy_port, username=username, password=password
+            )
+            socket.socket = socks.socksocket
+
+        try:
+            sock = socket.create_connection((host, port), timeout=10)
+            ctx = ssl.create_default_context()
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+            tls_sock = ctx.wrap_socket(sock, server_hostname=host)
+            banner = tls_sock.recv(256).split(b"\n")[0].decode(errors="ignore").strip()
+            tls_version = tls_sock.version()
+            cipher = tls_sock.cipher()[0]
+            logging.info(
+                "filter_p1 TLS via %s: %s %s sni=%s",
+                proxy_url,
+                tls_version,
+                cipher,
+                host,
+            )
+            if not banner.startswith("+OK"):
+                tls_sock.close()
+                socket.socket = original_socket
+                return False
+            start = time.perf_counter()
+            tls_sock.sendall(b"STAT\r\n")
+            resp = tls_sock.recv(256)
+            rtt = time.perf_counter() - start
+            line = resp.split(b"\n")[0]
+            tls_sock.close()
+            socket.socket = original_socket
+            if rtt > 2.0 or not line.startswith(b"+OK"):
+                return False
+            return True
+        except (socket.gaierror, socket.timeout, TimeoutError):
+            socket.socket = original_socket
+            if attempt < retries:
+                time.sleep(backoff[attempt])
+                continue
+            return False
+        except Exception:
+            socket.socket = original_socket
             return False
 
-        if scheme.startswith("socks5"):
-            proxy_type = socks.SOCKS5
-        elif scheme.startswith("socks4"):
-            proxy_type = socks.SOCKS4
-        elif scheme in ("http", "https"):
-            proxy_type = socks.HTTP
-        else:
-            print(f"Unsupported proxy scheme: {scheme}")
-            return False
-
-        socks.set_default_proxy(
-            proxy_type, proxy_host, proxy_port, username=username, password=password
-        )
-        socket.socket = socks.socksocket
-
-    try:
-        sock = socket.create_connection((host, port), timeout=10)
-        print("TCP OK")
-    except Exception as exc:
-        print(str(exc))
-        socket.socket = original_socket
-        return False
-
-    try:
-        ctx = ssl.create_default_context()
-        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-        tls_sock = ctx.wrap_socket(sock, server_hostname=host)
-        tls_version = tls_sock.version()
-        cipher = tls_sock.cipher()[0]
-        print(f"TLS OK: {tls_version}, {cipher}")
-        tls_sock.close()
-        result = True
-    except Exception as exc:
-        print(str(exc))
-        result = False
-    finally:
-        socket.socket = original_socket
-
-    return result
+    return False
 
 
 async def _score_single_proxy(p: str, ctx: ssl.SSLContext) -> tuple[str, int, dict[str, int]] | None:
@@ -1481,11 +1553,12 @@ async def _score_single_proxy(p: str, ctx: ssl.SSLContext) -> tuple[str, int, di
     if not norm:
         return None
     proto, ip, port = norm.split(":")
+    proxy_id = PROXY_ID_MAP.get(norm, p)
     ip_obj = ipaddress.ip_address(ip)
 
     ip_factor = _ip_rep_factor(ip_obj)
     if ip_factor == 0.0:
-        update_ip_history(ip, False)
+        update_freshness(proxy_id, False)
         return None
 
     if proto in ("socks5", "https"):
@@ -1493,12 +1566,12 @@ async def _score_single_proxy(p: str, ctx: ssl.SSLContext) -> tuple[str, int, di
     elif proto == "socks4":
         type_factor = 0.5
     else:
-        update_ip_history(ip, False)
+        update_freshness(proxy_id, False)
         return None
 
     tls_factor = await _tls_factor(ip, int(port), ctx)
     if tls_factor == 0.0:
-        update_ip_history(ip, False)
+        update_freshness(proxy_id, False)
         return None
 
     critical_score = (
@@ -1510,18 +1583,10 @@ async def _score_single_proxy(p: str, ctx: ssl.SSLContext) -> tuple[str, int, di
     ja3 = await get_ja3(norm)
     ja3_factor = 0.0 if ja3 and ja3 in KNOWN_BAD_JA3 else 1.0
 
-    now = time.time()
-    hist = HISTORY.get(ip)
-    if not hist or now - hist[0] > 24 * 3600:
-        age_hours = 0
-        fail_cnt = 0
-    else:
-        age_hours = int((now - hist[0]) / 3600)
-        fail_cnt = hist[1]
-
-    if age_hours == 0 and fail_cnt == 0:
+    fresh_val = get_freshness(proxy_id)
+    if fresh_val >= 0.8:
         fresh_factor = 1.0
-    elif fail_cnt > 100:
+    elif fresh_val <= 0.2:
         fresh_factor = 0.0
     else:
         fresh_factor = 0.5
@@ -1535,7 +1600,9 @@ async def _score_single_proxy(p: str, ctx: ssl.SSLContext) -> tuple[str, int, di
     else:
         net_factor = 0.0
 
-    if asn in CLOUD_ASNS:
+    if ALLOWED_ASNS and asn not in ALLOWED_ASNS:
+        asn_factor = 0.0
+    elif asn in CLOUD_ASNS:
         asn_factor = 0.0
     elif ASN_TYPE.get(asn, "").lower().startswith("grey"):
         asn_factor = 0.5
@@ -1550,7 +1617,9 @@ async def _score_single_proxy(p: str, ctx: ssl.SSLContext) -> tuple[str, int, di
     country = geo_lookup(ip)
     if country is None:
         logging.debug("Geo lookup failed for %s", ip)
-    if country in ALLOWED_COUNTRIES:
+    if ALLOWED_COUNTRIES and country not in ALLOWED_COUNTRIES:
+        geo_factor = 0.0
+    elif country in ALLOWED_COUNTRIES:
         geo_factor = 1.0
     elif country in EU_COUNTRIES:
         geo_factor = 0.5
@@ -1590,10 +1659,10 @@ async def _score_single_proxy(p: str, ctx: ssl.SSLContext) -> tuple[str, int, di
     )
 
     if total_score < OVERALL_MIN or critical_score < CRITICAL_MIN:
-        update_ip_history(ip, False)
+        update_freshness(proxy_id, False)
         return None
 
-    update_ip_history(ip, True)
+    update_freshness(proxy_id, True)
     STATS["score_samples"].append(total_score)
     STATS["network_class"][netclass] += 1
     if country:
@@ -1631,6 +1700,7 @@ async def filter_p2(proxies: list[str]) -> list[tuple[str, int]]:
     await load_ja3_sets()
     await load_asn_metadata()
     await load_geoip()
+    load_allow_lists()
     ctx = ssl.create_default_context()
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
@@ -1685,6 +1755,7 @@ async def add_proxies(proxies: List[str], source: str = "unknown") -> None:
             p = normalize_proxy(raw)
             if not p or p in proxy_set:
                 continue
+            PROXY_ID_MAP[p] = raw.strip()
             proxy_set.add(p)
             proto = p.split(":", 1)[0]
             STATS["total_scraped"] += 1
@@ -1703,6 +1774,7 @@ def add_proxies_sync(proxies: List[str], source: str = "unknown") -> None:
             p = normalize_proxy(raw)
             if not p or p in proxy_set:
                 continue
+            PROXY_ID_MAP[p] = raw.strip()
             proxy_set.add(p)
             proto = p.split(":", 1)[0]
             STATS["total_scraped"] += 1

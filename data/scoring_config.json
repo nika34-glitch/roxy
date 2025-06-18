@@ -1,0 +1,35 @@
+{
+  "mode": "strict",
+  "strict": {
+    "CRITICAL_MIN": 325,
+    "OVERALL_MIN": 700,
+    "WEIGHTS": {
+      "ip_rep": 179,
+      "proxy_type": 152,
+      "tls_reach": 152,
+      "ja3": 124,
+      "fresh": 83,
+      "nettype": 83,
+      "asn": 83,
+      "err_rate": 48,
+      "geo": 48,
+      "latency": 48
+    }
+  },
+  "lenient": {
+    "CRITICAL_MIN": 300,
+    "OVERALL_MIN": 600,
+    "WEIGHTS": {
+      "ip_rep": 120,
+      "proxy_type": 152,
+      "tls_reach": 152,
+      "ja3": 80,
+      "fresh": 83,
+      "nettype": 83,
+      "asn": 83,
+      "err_rate": 48,
+      "geo": 24,
+      "latency": 24
+    }
+  }
+}

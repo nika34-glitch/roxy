@@ -371,7 +371,14 @@ MAIN_LOOP: asyncio.AbstractEventLoop | None = None
 
 proxy_set: ScalableBloomFilter = ScalableBloomFilter(mode=ScalableBloomFilter.SMALL_SET_GROWTH)
 if aiodns is not None:
-    DNS_RESOLVER = aiodns.DNSResolver()
+    try:
+        DNS_RESOLVER = aiodns.DNSResolver()
+    except RuntimeError:
+        class _DummyResolver:
+            async def gethostbyname(self, host, family):
+                raise RuntimeError("aiodns requires an event loop")
+
+        DNS_RESOLVER = _DummyResolver()
 else:  # pragma: no cover - optional dependency missing
     class _DummyResolver:
         async def gethostbyname(self, host, family):

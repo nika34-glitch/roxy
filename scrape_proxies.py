@@ -291,6 +291,44 @@ async def get_aiohttp_session() -> Any:
         aiohttp_session = aiohttp.ClientSession()
     return aiohttp_session
 
+def _extract_from_text(text: str) -> List[str]:
+    text = text.strip()
+    proxies: List[str] = []
+    if text.startswith("[") or text.startswith("{"):
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict) and "proxies" in data:
+                data = data["proxies"]
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        ip = item.get("ip") or item.get("host")
+                        port = item.get("port")
+                        if ip and port:
+                            proxies.append(f"{ip}:{port}")
+                    elif isinstance(item, str):
+                        m = IP_PORT_RE.search(item)
+                        if m:
+                            host = m.group("ip6") or m.group("ip4")
+                            proxies.append(f"{host}:{m.group('port')}")
+        except Exception:
+            pass
+    if not proxies:
+        for line in text.splitlines():
+            m = IP_PORT_RE.search(line.strip())
+            if m:
+                host = m.group("ip6") or m.group("ip4")
+                proxies.append(f"{host}:{m.group('port')}")
+    return proxies
+
+
+async def _extract_from_response(resp: Any) -> List[str]:
+    lines: List[str] = []
+    async for raw_line in resp.content:
+        lines.append(raw_line.decode(errors="ignore"))
+    return _extract_from_text("\n".join(lines))
+
+
 async def fetch_proxxy_sources() -> AsyncGenerator[List[str], None]:
     sources = PROXXY_SOURCES
     urls = [u for lst in sources.values() for u in lst]
@@ -301,14 +339,8 @@ async def fetch_proxxy_sources() -> AsyncGenerator[List[str], None]:
         url = tasks[task]
         try:
             resp = await task
-            async for raw_line in resp.content:
-                line = raw_line.decode(errors="ignore").strip()
-                m = IP_PORT_RE.search(line)
-                if not m:
-                    continue
-                host = m.group("ip6") or m.group("ip4")
-                port = m.group("port")
-                batch.append(f"{host}:{port}")
+            for proxy in await _extract_from_response(resp):
+                batch.append(proxy)
                 if len(batch) >= 1000:
                     yield batch
                     batch = []
@@ -326,14 +358,8 @@ async def collect_proxies_by_type() -> dict[str, List[str]]:
         for url in urls:
             try:
                 resp = await session.get(url, timeout=REQUEST_TIMEOUT)
-                async for raw_line in resp.content:
-                    line = raw_line.decode(errors="ignore").strip()
-                    m = IP_PORT_RE.search(line)
-                    if not m:
-                        continue
-                    host = m.group("ip6") or m.group("ip4")
-                    port = m.group("port")
-                    result[proto].append(f"{host}:{port}")
+                proxies = await _extract_from_response(resp)
+                result[proto].extend(proxies)
             except Exception as e:  # pragma: no cover - network failures
                 _log.error("proXXy source error %s: %s", url, e)
     return result

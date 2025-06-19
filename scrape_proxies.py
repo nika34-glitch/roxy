@@ -336,6 +336,7 @@ async def fetch_proxxy_sources() -> AsyncGenerator[List[str], None]:
     session = await get_aiohttp_session()
     tasks = {asyncio.create_task(session.get(url, timeout=REQUEST_TIMEOUT)): url for url in urls}
     batch: List[str] = []
+    seen: set[str] = set()
     for task in asyncio.as_completed(tasks):
         url = tasks[task]
         try:
@@ -345,6 +346,9 @@ async def fetch_proxxy_sources() -> AsyncGenerator[List[str], None]:
                 text_parts.append(raw_line.decode(errors="ignore"))
             proxies = extract_proxies_from_text("\n".join(text_parts))
             for p in proxies:
+                if p in seen:
+                    continue
+                seen.add(p)
                 batch.append(p)
                 if len(batch) >= 1000:
                     yield batch
@@ -358,6 +362,7 @@ async def fetch_proxxy_sources() -> AsyncGenerator[List[str], None]:
 async def collect_proxies_by_type() -> dict[str, List[str]]:
     """Return proxies from all sources grouped by proxy type."""
     result: dict[str, List[str]] = {k: [] for k in PROXXY_SOURCES}
+    seen: dict[str, set[str]] = {k: set() for k in PROXXY_SOURCES}
     session = await get_aiohttp_session()
     for proto, urls in PROXXY_SOURCES.items():
         for url in urls:
@@ -367,7 +372,11 @@ async def collect_proxies_by_type() -> dict[str, List[str]]:
                 async for raw_line in resp.content:
                     text_parts.append(raw_line.decode(errors="ignore"))
                 proxies = extract_proxies_from_text("\n".join(text_parts))
-                result[proto].extend(proxies)
+                for p in proxies:
+                    if p in seen[proto]:
+                        continue
+                    seen[proto].add(p)
+                    result[proto].append(p)
             except Exception as e:  # pragma: no cover - network failures
                 _log.error("proXXy source error %s: %s", url, e)
     return result
@@ -694,25 +703,43 @@ async def probe_proxies(proxies: List[str], concurrency: int = 10000, timeout: f
 
 
 def _check_tls_sync(proxy: str, ptype: str, timeout: float, host: str, port: int) -> bool:
-    try:
-        import socks  # type: ignore
-    except Exception as exc:  # pragma: no cover - missing dependency
-        raise RuntimeError("PySocks required") from exc
+    if ptype == "direct":
+        import socket
+        try:
+            sock = socket.create_connection((host, port), timeout=timeout)
+        except Exception:
+            return False
+    else:
+        try:
+            import socks  # type: ignore
+        except Exception as exc:  # pragma: no cover - missing dependency
+            raise RuntimeError("PySocks required") from exc
 
-    addr = _split_host_port(proxy)
-    if not addr:
-        return False
-    phost, pport = addr
-    sock = socks.socksocket()
-    if ptype == "socks5":
-        sock.set_proxy(socks.SOCKS5, phost, pport)
-    elif ptype == "socks4":
-        sock.set_proxy(socks.SOCKS4, phost, pport)
-    elif ptype in {"http", "https"}:
-        sock.set_proxy(socks.HTTP, phost, pport)
+        addr = _split_host_port(proxy)
+        if not addr:
+            return False
+        phost, pport = addr
+        sock = socks.socksocket()
+        if ptype == "socks5":
+            sock.set_proxy(socks.SOCKS5, phost, pport)
+        elif ptype == "socks4":
+            sock.set_proxy(socks.SOCKS4, phost, pport)
+        elif ptype in {"http", "https"}:
+            sock.set_proxy(socks.HTTP, phost, pport)
+        sock.settimeout(timeout)
+        try:
+            sock.connect((host, port))
+        except Exception:
+            try:
+                sock.close()
+            finally:
+                return False
     sock.settimeout(timeout)
     try:
-        sock.connect((host, port))
+        if ptype == "direct":
+            pass  # connection already established
+        else:
+            pass  # connection done above
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
@@ -749,8 +776,13 @@ async def scrape() -> List[str]:
 
     data = await collect_proxies_by_type()
     proxies: List[str] = []
+    seen: set[str] = set()
     for lst in data.values():
-        proxies.extend(lst)
+        for p in lst:
+            if p in seen:
+                continue
+            seen.add(p)
+            proxies.append(p)
     return proxies
 
 
@@ -758,13 +790,18 @@ async def classify(proxies: List[str], timeout: float = 2.0) -> List[str]:
     """Return normalized proxies with detected protocol."""
 
     result: List[str] = []
+    seen: set[str] = set()
     sem = asyncio.Semaphore(1000)
 
     async def worker(p: str) -> None:
         async with sem:
             kind = await classify_proxy(p, timeout)
         if kind:
-            result.append(f"{kind}:{p}")
+            norm = f"{kind}:{p}"
+            if norm in seen:
+                return
+            seen.add(norm)
+            result.append(norm)
 
     tasks = [asyncio.create_task(worker(p)) for p in proxies]
     for t in asyncio.as_completed(tasks):

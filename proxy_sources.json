@@ -1,6 +1,24 @@
 {
-    "HTTP": ["https://example.com/http.txt"],
-    "HTTPS": ["https://example.com/https.txt"],
-    "SOCKS4": ["https://example.com/socks4.txt"],
-    "SOCKS5": ["https://example.com/socks5.txt"]
+  "HTTP": [
+    "https://example.com/http.txt",
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt",
+    "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/http.txt",
+    "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/http_proxies.txt"
+  ],
+  "HTTPS": [
+    "https://example.com/https.txt",
+    "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/https.txt",
+    "https://raw.githubusercontent.com/claude89757/free_https_proxies/refs/heads/main/https_proxies.txt"
+  ],
+  "SOCKS4": [
+    "https://example.com/socks4.txt",
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks4/data.txt",
+    "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/socks4_proxies.txt"
+  ],
+  "SOCKS5": [
+    "https://example.com/socks5.txt",
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt",
+    "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/socks5.txt",
+    "https://raw.githubusercontent.com/dpangestuw/Free-Proxy/refs/heads/main/socks5_proxies.txt"
+  ]
 }

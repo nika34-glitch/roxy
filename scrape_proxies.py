@@ -952,15 +952,21 @@ else:
     ]
 _test_url_cycle = itertools.cycle(TEST_URLS)
 TEST_URL = TEST_URLS[0]
-POOL_LIMIT = int(os.getenv("POOL_LIMIT", str(min(200, (os.cpu_count() or 1) * 40))))
-MIN_POOL_LIMIT = 5
-MAX_POOL_LIMIT = int(os.getenv("MAX_POOL_LIMIT", str((os.cpu_count() or 1) * 20)))
+# Default concurrency is tuned for large scale scraping.  Allow overriding via
+# environment variables but default to a very high limit.
+POOL_LIMIT = int(os.getenv("POOL_LIMIT", "12000"))
+MIN_POOL_LIMIT = int(os.getenv("MIN_POOL_LIMIT", "8000"))
+MAX_POOL_LIMIT = int(os.getenv("MAX_POOL_LIMIT", "14000"))
 CHECK_CONNECT_TIMEOUT = float(os.getenv("CHECK_CONNECT_TIMEOUT", "3"))
 CHECK_READ_TIMEOUT = float(os.getenv("CHECK_READ_TIMEOUT", "3"))
 PROXY_CACHE_TTL = int(os.getenv("PROXY_CACHE_TTL", "300"))
 KNOWN_GOOD_TTL = int(os.getenv("KNOWN_GOOD_TTL", "3600"))
 CHECK_CHUNK_SIZE = int(os.getenv("CHECK_CHUNK_SIZE", "200"))
 MAX_RETRIES = int(os.getenv("CHECK_MAX_RETRIES", "2"))
+
+# When enabled, SOCKS proxies are written to disk immediately after validation
+# to minimize latency between discovery and persistence.
+SOCKS_IMMEDIATE_WRITE = os.getenv("SOCKS_IMMEDIATE_WRITE", "1") == "1"
 
 # Ports to test via HTTP CONNECT against Libero Mail services
 LIBERO_PORTS = [443, 993, 995, 143, 110]
@@ -1407,25 +1413,31 @@ async def write_entries(entries: list[str]) -> None:
             STATS["written_per_proto"][proto] += len(items)
             continue
 
-        f = _open_files.get(path)
-        if f is None:
-            f = await aiofiles.open(path, mode)
-            _open_files[path] = f
+        if proto in {"socks4", "socks5"} and SOCKS_IMMEDIATE_WRITE:
+            async with aiofiles.open(path, mode) as f:
+                for line in items:
+                    await f.write(line + "\n")
+                    await f.flush()
+        else:
+            f = _open_files.get(path)
+            if f is None:
+                f = await aiofiles.open(path, mode)
+                _open_files[path] = f
 
-        buf: list[str] = []
-        size = 0
-        for line in items:
-            line = line + "\n"
-            buf.append(line)
-            size += len(line)
-            if size >= 65536:
+            buf: list[str] = []
+            size = 0
+            for line in items:
+                line = line + "\n"
+                buf.append(line)
+                size += len(line)
+                if size >= 65536:
+                    await f.writelines(buf)
+                    await f.flush()
+                    buf = []
+                    size = 0
+            if buf:
                 await f.writelines(buf)
                 await f.flush()
-                buf = []
-                size = 0
-        if buf:
-            await f.writelines(buf)
-            await f.flush()
         STATS["written_per_proto"][proto] += len(items)
 
 
@@ -1841,24 +1853,33 @@ async def writer_loop() -> None:
             continue
         entries = await quick_validate(entries)
         http_entries = [p for p in entries if p.split(":", 1)[0] in {"http", "https"}]
-        other_entries = [p for p in entries if p.split(":", 1)[0] not in {"http", "https"}]
+        socks_entries = [p for p in entries if p.split(":", 1)[0] in {"socks4", "socks5"}]
+        other_entries = [
+            p
+            for p in entries
+            if p.split(":", 1)[0] not in {"http", "https", "socks4", "socks5"}
+        ]
 
         if http_entries:
             ok_http = await filter_http_connect(http_entries)
             await write_http_connect_entries(ok_http)
 
-        entries = other_entries
-        if not entries:
-            continue
+        async def handle(batch: list[str]) -> None:
+            if not batch:
+                return
+            batch = await _filter_p1_batch(batch)
+            good, _ = await filter_p2(batch)
+            score_map = {p: s for p, s in good}
+            batch = await filter_working(list(score_map.keys()))
+            batch, port_map = await filter_libero_ports(batch)
+            to_save = [f"{p};score={score_map[p]}" for p in batch]
+            await write_entries(to_save)
+            await write_libero_entries(port_map, score_map)
 
-        entries = await _filter_p1_batch(entries)
-        good, _ = await filter_p2(entries)
-        score_map = {p: s for p, s in good}
-        entries = await filter_working(list(score_map.keys()))
-        entries, port_map = await filter_libero_ports(entries)
-        to_save = [f"{p};score={score_map[p]}" for p in entries]
-        await write_entries(to_save)
-        await write_libero_entries(port_map, score_map)
+        # Prioritize SOCKS proxies
+        await handle(socks_entries)
+        await handle(other_entries)
+
         if len(proxy_set) > MAX_PROXY_SET_SIZE:
             logging.info("Flushing proxy set to limit memory usage")
             STATS["flushes"] += 1

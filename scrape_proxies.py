@@ -251,6 +251,84 @@ OPENPROXYLIST_ENDPOINTS = [
     "https://openproxylist.xyz/socks5.txt",
 ]
 
+# Simplified Bloody-Proxy-Scraper configuration
+BLOODY_COOLDOWN = 0  # delay between individual requests
+BLOODY_SOURCES = {
+    "http": [
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-https.txt",
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all",
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/archive/txt/proxies-https.txt",
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/archive/txt/proxies-http.txt",
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+        "https://www.proxy-list.download/api/v1/get?type=http",
+        "https://www.proxy-list.download/api/v1/get?type=https",
+        "https://www.proxyscan.io/download?type=http",
+        "https://www.proxyscan.io/download?type=https",
+        "https://api.openproxylist.xyz/http.txt",
+    ],
+    "socks4": [
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks4.txt",
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks4&timeout=10000&country=all",
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/archive/txt/proxies-socks4.txt",
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS4_RAW.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
+        "https://www.proxy-list.download/api/v1/get?type=socks4",
+        "https://www.proxyscan.io/download?type=socks4",
+        "https://api.openproxylist.xyz/socks4.txt",
+    ],
+    "socks5": [
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt",
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=socks5&timeout=10000&country=all",
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/archive/txt/proxies-socks5.txt",
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
+        "https://github.com/jetkai/proxy-list/blob/main/archive/txt/proxies-socks5.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+        "https://www.proxy-list.download/api/v1/get?type=socks5",
+        "https://api.openproxylist.xyz/socks5.txt",
+    ],
+}
+
+
+class BloodyProxyScraper:
+    """Lightweight scraper using ``BLOODY_SOURCES`` URLs."""
+
+    def __init__(self, cooldown: int = BLOODY_COOLDOWN):
+        self.http_urls = BLOODY_SOURCES.get("http", [])
+        self.socks4_urls = BLOODY_SOURCES.get("socks4", [])
+        self.socks5_urls = BLOODY_SOURCES.get("socks5", [])
+        self.cooldown = cooldown
+
+    def _scrape(self, urls: list[str]) -> list[str]:
+        out: list[str] = []
+        for url in urls:
+            try:
+                r = requests.get(url, timeout=10)
+                out.extend(line.strip() for line in r.text.splitlines() if line.strip())
+                if self.cooldown:
+                    time.sleep(self.cooldown)
+            except requests.RequestException:
+                continue
+        return out
+
+    def scrape_all(self) -> list[str]:
+        proxies = self._scrape(self.http_urls)
+        proxies += self._scrape(self.socks4_urls)
+        proxies += self._scrape(self.socks5_urls)
+        # remove duplicates while preserving order
+        seen: set[str] = set()
+        uniq: list[str] = []
+        for p in proxies:
+            if p not in seen:
+                seen.add(p)
+                uniq.append(p)
+        return uniq
+
 SCRAPERS = {
     "mtpro": MT_INTERVAL,
     "freeproxy_world": 20,
@@ -3242,42 +3320,15 @@ async def scrape_proxybros() -> None:
 
 
 async def scrape_bloody_proxies() -> None:
-    """Run Bloody-Proxy-Scraper and merge results."""
+    """Fetch proxies from the bundled Bloody sources."""
     interval = SCRAPERS["bloody"]
-    module_path = (
-        Path(__file__).resolve().parent
-        / "vendor"
-        / "Bloody-Proxy-Scraper"
-        / "data"
-        / "proxyscraper.py"
-    )
-    if not module_path.is_file():
-        logging.warning(
-            "Bloody-Proxy-Scraper module not found, disabling Bloody scraping"
-        )
-        return
-
-    spec = importlib.util.spec_from_file_location(
-        "bloody_proxyscraper", module_path
-    )
-    loader = spec.loader if spec else None
-    if not spec or loader is None:
-        logging.error("Unable to load Bloody-Proxy-Scraper module")
-        return
-    module = importlib.util.module_from_spec(spec)
-    try:
-        loader.exec_module(module)
-    except FileNotFoundError:
-        logging.error("Unable to load Bloody-Proxy-Scraper module: file missing")
-        return
-    Scraper = module.ProxyScraper
+    Scraper = BloodyProxyScraper
 
     while True:
         proxies: list[str] = []
         try:
             scraper = Scraper()
-            result = scraper.scrape_all_proxies()
-            proxies = result.get("all", [[], False])[0]
+            proxies = await asyncio.to_thread(scraper.scrape_all)
         except Exception as e:
             logging.error("Error running Bloody-Proxy-Scraper: %s", e)
 

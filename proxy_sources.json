@@ -5,18 +5,25 @@
     "https://raw.githubusercontent.com/Skiddle-ID/proxylist/refs/heads/main/proxies.json",
     "https://raw.githubusercontent.com/zebbern/Proxy-Scraper/refs/heads/main/http.txt",
     "https://raw.githubusercontent.com/zebbern/Proxy-Scraper/refs/heads/main/proxydump.txt",
-    "https://raw.githubusercontent.com/lalifeier/proxy-scraper/main/proxies/http.txt"
+    "https://raw.githubusercontent.com/lalifeier/proxy-scraper/main/proxies/http.txt",
+    "https://raw.githubusercontent.com/berkay-digital/Proxy-Scraper/refs/heads/main/proxies.txt",
+    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/refs/heads/master/http.txt",
+    "https://hidemy.name/en/proxy-list",
+    "https://www.proxynova.com/proxy-server-list",
+    "https://raw.githubusercontent.com/sunny9577/proxy-scraper/refs/heads/master/proxies.txt"
   ],
   "HTTPS": [
     "https://example.com/https.txt",
     "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/https.txt",
-    "https://api.openproxylist.xyz/https.txt"
+    "https://api.openproxylist.xyz/https.txt",
+    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/refs/heads/master/https.txt"
   ],
   "SOCKS4": [
     "https://example.com/socks4.txt",
     "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks4/data.txt",
     "https://raw.githubusercontent.com/zebbern/Proxy-Scraper/refs/heads/main/socks4.txt",
-    "https://raw.githubusercontent.com/lalifeier/proxy-scraper/main/proxies/socks4.txt"
+    "https://raw.githubusercontent.com/lalifeier/proxy-scraper/main/proxies/socks4.txt",
+    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/refs/heads/master/socks4.txt"
   ],
   "SOCKS5": [
     "https://example.com/socks5.txt",
@@ -25,6 +32,7 @@
     "https://raw.githubusercontent.com/hookzof/socks5_list/master/tg/mtproto.json",
     "https://raw.githubusercontent.com/hookzof/socks5_list/master/tg/socks.json",
     "https://raw.githubusercontent.com/zebbern/Proxy-Scraper/refs/heads/main/socks5.txt",
-    "https://raw.githubusercontent.com/lalifeier/proxy-scraper/main/proxies/socks5.txt"
+    "https://raw.githubusercontent.com/lalifeier/proxy-scraper/main/proxies/socks5.txt",
+    "https://www.proxy-list.download/api/v1/get?type=socks5"
   ]
 }

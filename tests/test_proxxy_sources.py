@@ -40,7 +40,8 @@ def test_fetch_proxxy_sources(monkeypatch):
     monkeypatch.setattr(sp, "PROXXY_SOURCES", {"HTTP": ["http://example.com"]})
 
     async def fake_session():
-        return FakeSession("1.1.1.1:1\ninvalid\n2.2.2.2:2")
+        text = "http://1.1.1.1:1\ninvalid\n2.2.2.2:2 extra\n[2001:db8::1]:8080"
+        return FakeSession(text)
 
     monkeypatch.setattr(sp, "get_aiohttp_session", fake_session)
 
@@ -57,7 +58,7 @@ def test_fetch_proxxy_sources(monkeypatch):
         return out
 
     proxies = asyncio.run(run())
-    assert proxies == ["1.1.1.1:1", "2.2.2.2:2"]
+    assert proxies == ["1.1.1.1:1", "2.2.2.2:2", "2001:db8::1:8080"]
 
 
 def test_proxyspider_extract():
@@ -70,8 +71,8 @@ def test_proxyspider_extract():
 def test_collect_proxies_by_type(monkeypatch, tmp_path):
     sp = importlib.import_module("scrape_proxies")
     mapping = {
-        "http://h": "1.1.1.1:1\n",
-        "http://s5": "2.2.2.2:2\ninvalid",
+        "http://h": "http://1.1.1.1:1\n",
+        "http://s5": "[2001:db8::1]:1080\ninvalid",
     }
     monkeypatch.setattr(sp, "PROXXY_SOURCES", {"HTTP": ["http://h"], "SOCKS5": ["http://s5"]})
 
@@ -81,7 +82,7 @@ def test_collect_proxies_by_type(monkeypatch, tmp_path):
     monkeypatch.setattr(sp, "get_aiohttp_session", fake_session)
 
     res = asyncio.run(sp.collect_proxies_by_type())
-    assert res == {"HTTP": ["1.1.1.1:1"], "SOCKS5": ["2.2.2.2:2"]}
+    assert res == {"HTTP": ["1.1.1.1:1"], "SOCKS5": ["2001:db8::1:1080"]}
 
     out = tmp_path / "out.json"
     asyncio.run(sp.save_proxies_json(str(out)))

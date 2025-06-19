@@ -16,14 +16,12 @@ except Exception:
     uvloop = None
 from functools import lru_cache
 import socket
-import struct
 import json
 import ssl
 import importlib.util
 from pathlib import Path
 from typing import Any, AsyncGenerator, List
 from concurrent.futures import ThreadPoolExecutor
-import multiprocessing
 import gzip
 from io import StringIO
 try:
@@ -135,14 +133,6 @@ BLOODY_INTERVAL = 300  # seconds between Bloody-Proxy-Scraper runs
 MAX_PROXY_SET_SIZE = int(os.getenv("MAX_PROXY_SET_SIZE", "100000"))
 
 MT_INTERVAL = 1  # seconds between mtpro.xyz polls
-PASTE_INTERVAL = 60  # seconds between paste feed checks
-FEED_DELAY_RANGE = (5, 10)  # delay between individual feed requests
-
-PASTE_FEEDS = [
-    "https://pastebin.com/feed",
-    "https://ghostbin.com/recent",
-    "https://paste.ee/rss",
-]
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
@@ -155,71 +145,6 @@ IP_PORT_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$")
 PROTO_PARAM_RE = re.compile(r"protocol=([^&]+)")
 FREE_CZ_BASE64_RE = re.compile(r'Base64.decode\("([^"]+)"\)')
 FREE_CZ_PAGE_RE = re.compile(r"/en/proxylist/main/(\d+)")
-
-# IRC collection configuration
-IRC_SERVERS = [
-    "irc.undernet.org",
-    "irc.rizon.net",
-    "irc.libera.chat",
-    "irc.abjects.net",
-    "irc.efnet.org",
-    "irc.darkscience.net",
-    "irc.dal.net",
-]
-
-IRC_CHANNELS = [
-    "#proxy",
-    "#proxylist",
-    "#proxies",
-    "#proxyleaks",
-    "#socks",
-    "#socks4",
-    "#socks5",
-    "#leech",
-    "#leechers",
-    "#0day",
-    "#darkweb",
-    "#darkproxies",
-    "#http",
-    "#socks_proxy",
-    "#proxyfeeds",
-    "#botnet",
-    "#scraperbots",
-    "#anonproxies",
-    "#blackhat",
-    "#hackers",
-    "#freeland",
-    "#datadump",
-    "#dump",
-    "#proxy-dump",
-    "#proxy_bots",
-    "#proxy_scrape",
-    "#dumpville",
-    "#proxy_zone",
-    "#openproxies",
-    "#publicproxies",
-    "#proxyhunt",
-    "#torleaks",
-    "#rawfeeds",
-    "#autoproxy",
-    "#scanfeeds",
-    "#mirrors",
-    "#ipfeeds",
-    "#portscanners",
-    "#hostlist",
-    "#proxylogs",
-]
-
-# DHT crawling configuration
-BOOTSTRAP_NODES = [
-    ("router.bittorrent.com", 6881),
-    ("dht.transmissionbt.com", 6881),
-]
-MAX_DHT_CONCURRENCY = int(os.getenv("MAX_DHT_CONCURRENCY", "200"))
-MAX_DHT_WORKERS = int(os.getenv("MAX_DHT_WORKERS", "40"))
-DHT_PROCESSES = int(os.getenv("DHT_PROCESSES", "1"))
-PROXY_PORTS = {8080, 3128, 1080, 9050, 8000, 8081, 8888}
-DHT_LOG_EVERY = 100  # log progress every N visited nodes
 
 # Tor relay crawling configuration
 ONIONOO_URL = "https://onionoo.torproject.org/details"
@@ -326,7 +251,6 @@ OPENPROXYLIST_ENDPOINTS = [
 
 SCRAPERS = {
     "mtpro": MT_INTERVAL,
-    "paste": PASTE_INTERVAL,
     "freeproxy_world": 20,
     "free_proxy_cz": 20,
     "tor": TOR_INTERVAL,
@@ -988,7 +912,6 @@ PROXY_ID_MAP: dict[str, str] = {}
 
 # --- scraping statistics ---------------------------------------------------
 from collections import defaultdict
-from statistics import mean, median
 
 STATS: dict[str, Any] = {
     "total_scraped": 0,
@@ -1008,9 +931,6 @@ STATS: dict[str, Any] = {
     "written_per_proto": defaultdict(int),
     "flushes": 0,
     "peak_concurrency": 0,
-    "dht_proxies": 0,
-    "irc_proxies": 0,
-    "paste_proxies": 0,
     "api_counts": defaultdict(int),
     # counts of proxies able to CONNECT to each Libero Mail port
     "port_443": 0,
@@ -1068,14 +988,7 @@ def _stats_snapshot() -> dict[str, Any]:
     snap["http_connect_rate"] = (
         snap.get("http_connect_pass", 0) / total_http if total_http else 0.0
     )
-    if STATS["score_samples"]:
-        snap["score_min"] = min(STATS["score_samples"])
-        snap["score_median"] = median(STATS["score_samples"])
-        snap["score_mean"] = mean(STATS["score_samples"])
-        snap["score_max"] = max(STATS["score_samples"])
-    else:
-        snap["score_min"] = snap["score_median"] = 0.0
-        snap["score_mean"] = snap["score_max"] = 0.0
+    # score statistics removed
     return snap
 
 
@@ -2149,14 +2062,7 @@ def extract_proxies(text: str) -> list[str]:
     return found
 
 
-async def monitor_paste_feeds() -> None:
-    for feed in PASTE_FEEDS:
-        text = await fetch_with_backoff(feed)
-        if text:
-            proxies = extract_proxies(text)
-            STATS["paste_proxies"] += len(proxies)
-            await add_proxies(proxies, source="paste")
-        await asyncio.sleep(random.uniform(*FEED_DELAY_RANGE))
+
 
 
 async def scrape_tor_relays() -> None:
@@ -2673,273 +2579,7 @@ async def scrape_bloody_proxies() -> None:
         await asyncio.sleep(interval)
 
 
-async def _irc_listener(server: str, port: int = 6667) -> None:
-    """Connect to an IRC server and monitor channels for proxy announcements."""
-    import string
 
-    while True:
-        reader = writer = None
-        try:
-            reader, writer = await asyncio.open_connection(server, port)
-            nick = "bot" + "".join(
-                random.choices(string.ascii_lowercase + string.digits, k=6)
-            )
-            writer.write(f"NICK {nick}\r\n".encode())
-            writer.write(f"USER {nick} 0 * :{nick}\r\n".encode())
-            await writer.drain()
-
-            await asyncio.sleep(5)
-            channels = IRC_CHANNELS[:]
-            random.shuffle(channels)
-            for chan in channels:
-                writer.write(f"JOIN {chan}\r\n".encode())
-                await writer.drain()
-                await asyncio.sleep(random.uniform(1, 3))
-
-            while True:
-                line = await reader.readline()
-                if not line:
-                    raise ConnectionError("EOF")
-                text = line.decode(errors="ignore").strip()
-                if text.startswith("PING"):
-                    token = text.split()[1]
-                    writer.write(f"PONG {token}\r\n".encode())
-                    await writer.drain()
-                    continue
-                proxies = extract_proxies(text)
-                if proxies:
-                    STATS["irc_proxies"] += len(proxies)
-                    add_proxies_sync(proxies, source="irc")
-        except Exception as e:
-            logging.error("IRC %s error: %s", server, e)
-        finally:
-            if writer:
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except Exception:
-                    pass
-        await asyncio.sleep(10)
-
-
-async def monitor_irc_channels() -> None:
-    tasks = [asyncio.create_task(_irc_listener(s)) for s in IRC_SERVERS]
-    await asyncio.gather(*tasks)
-
-
-def bencode(value) -> bytes:
-    if isinstance(value, int):
-        return b"i" + str(value).encode() + b"e"
-    if isinstance(value, bytes):
-        return str(len(value)).encode() + b":" + value
-    if isinstance(value, str):
-        b = value.encode()
-        return str(len(b)).encode() + b":" + b
-    if isinstance(value, list):
-        return b"l" + b"".join(bencode(v) for v in value) + b"e"
-    if isinstance(value, dict):
-        items = sorted(value.items())
-        return b"d" + b"".join(bencode(k) + bencode(v) for k, v in items) + b"e"
-    raise TypeError("Unsupported type for bencoding")
-
-
-def bdecode(data: bytes):
-    def parse(index: int):
-        lead = data[index : index + 1]
-        if lead == b"i":
-            end = data.index(b"e", index + 1)
-            return int(data[index + 1 : end]), end + 1
-        if lead == b"l":
-            index += 1
-            lst = []
-            while data[index : index + 1] != b"e":
-                item, index = parse(index)
-                lst.append(item)
-            return lst, index + 1
-        if lead == b"d":
-            index += 1
-            d = {}
-            while data[index : index + 1] != b"e":
-                key, index = parse(index)
-                val, index = parse(index)
-                d[key] = val
-            return d, index + 1
-        if lead.isdigit():
-            colon = data.index(b":", index)
-            length = int(data[index:colon])
-            start = colon + 1
-            end = start + length
-            return data[start:end], end
-        raise ValueError("Invalid bencode")
-
-    value, _ = parse(0)
-    return value
-
-
-class DHTClient(asyncio.DatagramProtocol):
-    def __init__(self, node_id: bytes):
-        self.node_id = node_id
-        self.transactions: dict[bytes, asyncio.Future] = {}
-        self.transport: asyncio.DatagramTransport | None = None
-
-    def connection_made(self, transport: asyncio.BaseTransport) -> None:
-        self.transport = transport  # type: ignore
-
-    def datagram_received(self, data: bytes, addr) -> None:
-        try:
-            msg = bdecode(data)
-        except Exception:
-            return
-        tid = msg.get(b"t")
-        fut = self.transactions.pop(tid, None)
-        if fut and not fut.done():
-            fut.set_result((msg, addr))
-
-    async def _query(
-        self, addr: tuple[str, int], msg: dict
-    ) -> tuple[dict, tuple[str, int]]:
-        tid = os.urandom(2)
-        msg[b"t"] = tid
-        data = bencode(msg)
-        fut = asyncio.get_running_loop().create_future()
-        self.transactions[tid] = fut
-        assert self.transport is not None
-        self.transport.sendto(data, addr)
-        try:
-            return await asyncio.wait_for(fut, timeout=5)
-        finally:
-            self.transactions.pop(tid, None)
-
-    async def find_node(self, addr: tuple[str, int], target: bytes):
-        msg = {
-            b"y": b"q",
-            b"q": b"find_node",
-            b"a": {b"id": self.node_id, b"target": target},
-        }
-        return await self._query(addr, msg)
-
-    async def get_peers(self, addr: tuple[str, int], info_hash: bytes):
-        msg = {
-            b"y": b"q",
-            b"q": b"get_peers",
-            b"a": {b"id": self.node_id, b"info_hash": info_hash},
-        }
-        return await self._query(addr, msg)
-
-
-def _decode_nodes(data: bytes) -> list[tuple[str, int]]:
-    nodes = []
-    for i in range(0, len(data), 26):
-        segment = data[i : i + 26]
-        if len(segment) < 26:
-            continue
-        ip = socket.inet_ntoa(segment[20:24])
-        port = struct.unpack("!H", segment[24:26])[0]
-        nodes.append((ip, port))
-    return nodes
-
-
-def _decode_peers(values: list) -> list[tuple[str, int]]:
-    peers = []
-    for val in values:
-        if len(val) != 6:
-            continue
-        ip = socket.inet_ntoa(val[:4])
-        port = struct.unpack("!H", val[4:6])[0]
-        peers.append((ip, port))
-    return peers
-
-
-async def crawl_dht() -> None:
-    loop = asyncio.get_running_loop()
-    node_id = os.urandom(20)
-    try:
-        transport, client = await loop.create_datagram_endpoint(
-            lambda: DHTClient(node_id), local_addr=("0.0.0.0", 0), reuse_port=True
-        )
-    except ValueError:
-        transport, client = await loop.create_datagram_endpoint(
-            lambda: DHTClient(node_id), local_addr=("0.0.0.0", 0)
-        )
-
-    queue: asyncio.Queue[tuple[str, int]] = asyncio.Queue()
-    visited: set[tuple[str, int]] = set()
-
-    for host, port in BOOTSTRAP_NODES:
-        try:
-            infos = await loop.getaddrinfo(
-                host, port, family=socket.AF_INET, type=socket.SOCK_DGRAM
-            )
-            if infos:
-                ip = infos[0][4][0]
-                queue.put_nowait((ip, port))
-        except Exception as e:
-            logging.warning("Failed to resolve %s: %s", host, e)
-
-    sem = asyncio.Semaphore(MAX_DHT_CONCURRENCY)
-    count = 0
-
-    async def worker() -> None:
-        nonlocal count
-        batch: list[str] = []
-        while True:
-            ip, port = await queue.get()
-            if (ip, port) in visited:
-                queue.task_done()
-                continue
-            visited.add((ip, port))
-            async with sem:
-                try:
-                    resp, _ = await client.find_node((ip, port), os.urandom(20))
-                    nodes = _decode_nodes(resp.get(b"r", {}).get(b"nodes", b""))
-                    for n in nodes:
-                        if n not in visited:
-                            queue.put_nowait(n)
-                except Exception:
-                    pass
-                try:
-                    resp, _ = await client.get_peers((ip, port), os.urandom(20))
-                    vals = resp.get(b"r", {}).get(b"values", [])
-                    peers = _decode_peers(vals)
-                    for p_ip, p_port in peers:
-                        if p_port in PROXY_PORTS:
-                            batch.append(f"{p_ip}:{p_port}")
-                    if len(batch) >= 50:
-                        STATS["dht_proxies"] += len(batch)
-                        add_proxies_sync(batch, source="dht")
-                        batch = []
-                except Exception:
-                    pass
-
-                count += 1
-                if count % DHT_LOG_EVERY == 0:
-                    logging.info(
-                        "DHT: visited %s nodes, proxies %s",
-                        len(visited),
-                        len(proxy_set),
-                    )
-                    if batch:
-                        STATS["dht_proxies"] += len(batch)
-                        add_proxies_sync(batch, source="dht")
-                        batch = []
-            queue.task_done()
-
-    workers = [asyncio.create_task(worker()) for _ in range(MAX_DHT_WORKERS)]
-    await asyncio.gather(*workers)
-
-
-def _run_crawl_dht() -> None:
-    """Wrapper to execute crawl_dht inside a child process."""
-    asyncio.run(crawl_dht())
-
-
-def spawn_dht_processes() -> list[multiprocessing.Process]:
-    procs = []
-    for _ in range(DHT_PROCESSES):
-        p = multiprocessing.Process(target=_run_crawl_dht)
-        p.start()
-        procs.append(p)
-    return procs
 
 
 async def run_proxxy() -> None:
@@ -3111,12 +2751,9 @@ async def main() -> None:
     global MAIN_LOOP
     MAIN_LOOP = asyncio.get_running_loop()
     await load_blacklists()
-    procs = spawn_dht_processes()
     async with asyncio.TaskGroup() as tg:
         tg.create_task(run_periodic(scrape_mt_proxies, SCRAPERS["mtpro"], "mtpro"))
-        tg.create_task(run_periodic(monitor_paste_feeds, SCRAPERS["paste"], "paste"))
         tg.create_task(run_periodic(scrape_tor_relays, SCRAPERS["tor"], "tor"))
-        tg.create_task(monitor_irc_channels())
         tg.create_task(run_periodic(scrape_proxyscrape, SCRAPERS["proxyscrape"], "proxyscrape"))
         tg.create_task(run_periodic(scrape_gimmeproxy, SCRAPERS["gimmeproxy"], "gimmeproxy"))
         tg.create_task(run_periodic(scrape_pubproxy, SCRAPERS["pubproxy"], "pubproxy"))
@@ -3140,8 +2777,6 @@ async def main() -> None:
         tg.create_task(scrape_spys())
         tg.create_task(scrape_proxybros())
         tg.create_task(scrape_bloody_proxies())
-    for p in procs:
-        p.terminate()
 
 if __name__ == "__main__":
     import sys

@@ -6,9 +6,11 @@ import re
 import base64
 import asyncio
 import os
+
 try:
     if os.name != "nt":
         import uvloop
+
         asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
     else:
         uvloop = None
@@ -23,8 +25,25 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, List
 from urllib.parse import urlparse
 from concurrent.futures import ThreadPoolExecutor
+
+try:
+    from scrapy import Spider, Request  # type: ignore
+    from scrapy.crawler import CrawlerProcess  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    Spider = Request = object  # type: ignore
+
+    class _DummyCrawler:
+        def crawl(self, *_, **__):
+            return None
+
+        def start(self) -> None:
+            pass
+
+    CrawlerProcess = _DummyCrawler  # type: ignore
 import gzip
+import shutil
 from io import StringIO
+
 try:
     import orjson  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
@@ -44,9 +63,9 @@ import aiofiles
 # attribute is only used for type hints, so provide a minimal stub when
 # missing to avoid ``AttributeError`` at import time.
 if not hasattr(aiofiles, "BaseFile"):
+
     class _BF:
         pass
-
 
     aiofiles.BaseFile = _BF  # type: ignore[attr-defined]
 
@@ -62,6 +81,7 @@ from collections import defaultdict
 try:
     from pybloom_live import ScalableBloomFilter  # type: ignore
 except Exception:  # pragma: no cover - optional dependency
+
     class ScalableBloomFilter:  # minimal stub
         SMALL_SET_GROWTH = 2
 
@@ -73,6 +93,8 @@ except Exception:  # pragma: no cover - optional dependency
 
         def __contains__(self, item):
             return False
+
+
 try:
     from score_cython import score_single_proxy as cy_score_single_proxy
 except Exception:
@@ -100,6 +122,7 @@ try:
 except Exception:  # pragma: no cover - optional dependency
     BeautifulSoup = None  # type: ignore
 
+
 def create_soup(text: str):
     """Return ``BeautifulSoup`` object using available parser."""
     if BeautifulSoup is None:
@@ -108,6 +131,7 @@ def create_soup(text: str):
         return BeautifulSoup(text, "lxml")
     except Exception:
         return BeautifulSoup(text, "html.parser")
+
 
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "10"))
 
@@ -123,9 +147,106 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
-PROXXY_SOURCES_FILE = os.path.join(
-    os.path.dirname(__file__), "vendor", "proXXy", "proxy_sources.json"
-)
+# Embedded proxy source list from the original proXXy project.  The JSON file
+# shipped with the proXXy submodule is no longer loaded from disk; instead we
+# include the data directly so that the scraper has no external dependencies.
+PROXXY_SOURCES = {
+    "HTTP": [
+        "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/HTTP.txt",
+        "https://raw.githubusercontent.com/mmpx12/proxy-list/master/http.txt",
+        "https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all&ssl=all&anonymity=all",
+        "https://api.proxyscrape.com/?request=getproxies&proxytype=https&timeout=10000&country=all&ssl=all&anonymity=all",
+        "https://api.openproxylist.xyz/http.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies_anonymous/http.txt",
+        "https://raw.githubusercontent.com/shiftytr/proxy-list/master/proxy.txt",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt",
+        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/http.txt",
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-http.txt",
+        "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt",
+        "https://raw.githubusercontent.com/sunny9577/proxy-scraper/master/proxies.txt",
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
+        "https://raw.githubusercontent.com/opsxcq/proxy-list/master/list.txt",
+        "https://raw.githubusercontent.com/proxy4parsing/proxy-list/main/http.txt",
+        "https://rootjazz.com/proxies/proxies.txt",
+        "https://spys.me/proxy.txt",
+        "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/http.txt",
+        "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies_anonymous/http.txt",
+        "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/http.txt",
+        "https://sunny9577.github.io/proxy-scraper/proxies.txt",
+        "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/http.txt",
+        "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/http.txt",
+        "https://raw.githubusercontent.com/prxchk/proxy-list/main/http.txt",
+        "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/http.txt",
+        "https://github.com/zloi-user/hideip.me/raw/refs/heads/master/http.txt",
+        "https://raw.githubusercontent.com/saisuiu/Lionkings-Http-Proxys-Proxies/main/cnfree.txt",
+        "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/http_proxies.txt",
+        "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/http/http.txt",
+        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/http.txt",
+        "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/http/global/http_checked.txt",
+        "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/refs/heads/main/http.txt",
+        "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/protocols/http/data.txt",
+    ],
+    "SOCKS4": [
+        "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4",
+        "https://api.proxyscrape.com/?request=displayproxies&proxytype=socks4&country=all",
+        "https://api.openproxylist.xyz/socks4.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks4.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies_anonymous/socks4.txt",
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks4.txt",
+        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks4.txt",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks4.txt",
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS4_RAW.txt",
+        "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks4.txt",
+        "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/SOCKS4.txt",
+        "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/socks4.txt",
+        "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies_anonymous/socks4.txt",
+        "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/socks4.txt",
+        "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks4.txt",
+        "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks4.txt",
+        "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks4.txt",
+        "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks4.txt",
+        "https://github.com/zloi-user/hideip.me/raw/refs/heads/master/socks4.txt",
+        "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks4.txt",
+        "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/SOCKS4.txt",
+        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks4.txt",
+        "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/refs/heads/main/socks4.txt",
+        "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/protocols/socks4/data.txt",
+    ],
+    "SOCKS5": [
+        "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/SOCKS5.txt",
+        "https://raw.githubusercontent.com/mmpx12/proxy-list/master/socks5.txt",
+        "https://api.openproxylist.xyz/socks5.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies_anonymous/socks5.txt",
+        "https://raw.githubusercontent.com/ShiftyTR/Proxy-List/master/socks5.txt",
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-socks5.txt",
+        "https://raw.githubusercontent.com/roosterkid/openproxylist/main/SOCKS5_RAW.txt",
+        "https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/socks5.txt",
+        "https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt",
+        "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/rdavydov/proxy-list/main/proxies_anonymous/socks5.txt",
+        "https://raw.githubusercontent.com/zevtyardt/proxy-list/main/socks5.txt",
+        "https://raw.githubusercontent.com/MuRongPIG/Proxy-Master/main/socks5.txt",
+        "https://raw.githubusercontent.com/prxchk/proxy-list/main/socks5.txt",
+        "https://spys.me/socks.txt",
+        "https://github.com/zloi-user/hideip.me/raw/refs/heads/master/socks5.txt",
+        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/socks5.txt",
+        "https://raw.githubusercontent.com/elliottophellia/yakumo/master/results/socks5/global/socks5_checked.txt",
+        "https://raw.githubusercontent.com/ProxyScraper/ProxyScraper/refs/heads/main/socks5.txt",
+        "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/protocols/socks5/data.txt",
+    ],
+    "HTTPS": [
+        "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-https.txt",
+        "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/https.txt",
+        "https://api.proxyscrape.com/?request=getproxies&proxytype=https&timeout=10000&country=all&ssl=all&anonymity=all",
+        "https://github.com/zloi-user/hideip.me/raw/refs/heads/master/https.txt",
+        "https://raw.githubusercontent.com/Anonym0usWork1221/Free-Proxies/main/proxy_files/https_proxies.txt",
+        "https://raw.githubusercontent.com/officialputuid/KangProxy/KangProxy/https/https.txt",
+        "https://raw.githubusercontent.com/ErcinDedeoglu/proxies/main/proxies/https.txt",
+        "https://raw.githubusercontent.com/proxifly/free-proxy-list/refs/heads/main/proxies/protocols/https/data.txt",
+    ],
+}
 
 # ProxyHub async scraping configuration
 PROXYHUB_INTERVAL = 300.0  # seconds between ProxyHub runs
@@ -135,6 +256,36 @@ BLOODY_INTERVAL = 300  # seconds between Bloody-Proxy-Scraper runs
 MAX_PROXY_SET_SIZE = int(os.getenv("MAX_PROXY_SET_SIZE", "100000"))
 
 MT_INTERVAL = 1  # seconds between mtpro.xyz polls
+
+
+# ---------------------------------------------------------------------------
+# Proxxy utilities
+# ---------------------------------------------------------------------------
+
+
+def load_proxy_sources() -> dict:
+    """Return the embedded dictionary of proxy source URLs."""
+
+    return PROXXY_SOURCES
+
+
+def proxy_sources() -> dict:
+    """Backwards compatible wrapper returning ``load_proxy_sources()``."""
+
+    return load_proxy_sources()
+
+
+def vanity_line() -> str:
+    """Return a nice separator line matching terminal width."""
+
+    try:
+        terminal_width = shutil.get_terminal_size().columns
+    except OSError:
+        terminal_width = 80
+    dash = "—"
+    dashes = dash * (terminal_width - 2)
+    return f"<{dashes}>"
+
 
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0 Safari/537.36",
@@ -329,6 +480,7 @@ class BloodyProxyScraper:
                 uniq.append(p)
         return uniq
 
+
 SCRAPERS = {
     "mtpro": MT_INTERVAL,
     "freeproxy_world": 20,
@@ -373,17 +525,21 @@ httpx_client = None
 USE_HTTP2 = os.getenv("USE_HTTP2", "0") == "1"
 MAIN_LOOP: asyncio.AbstractEventLoop | None = None
 
-proxy_set: ScalableBloomFilter = ScalableBloomFilter(mode=ScalableBloomFilter.SMALL_SET_GROWTH)
+proxy_set: ScalableBloomFilter = ScalableBloomFilter(
+    mode=ScalableBloomFilter.SMALL_SET_GROWTH
+)
 if aiodns is not None:
     try:
         DNS_RESOLVER = aiodns.DNSResolver()
     except RuntimeError:
+
         class _DummyResolver:
             async def gethostbyname(self, host, family):
                 raise RuntimeError("aiodns requires an event loop")
 
         DNS_RESOLVER = _DummyResolver()
 else:  # pragma: no cover - optional dependency missing
+
     class _DummyResolver:
         async def gethostbyname(self, host, family):
             raise RuntimeError("aiodns not available")
@@ -402,6 +558,7 @@ DNS_CACHE_TTL = 60.0
 # ---------------------------------------------------------------------------
 # Provider classes originally from providers.py
 # ---------------------------------------------------------------------------
+
 
 class BadStatusError(Exception):
     """Raised when a provider returns a non-200 HTTP status."""
@@ -422,7 +579,9 @@ class Provider:
 
     _pattern = IPPortPatternGlobal
 
-    def __init__(self, url=None, proto=(), max_conn=4, max_tries=3, timeout=20, loop=None):
+    def __init__(
+        self, url=None, proto=(), max_conn=4, max_tries=3, timeout=20, loop=None
+    ):
         if url:
             self.domain = urlparse(url).netloc
         self.url = url
@@ -452,9 +611,16 @@ class Provider:
 
     async def get_proxies(self):
         log.debug("Try to get proxies from %s", self.domain)
-        async with aiohttp.ClientSession(headers=get_headers(), cookies=self._cookies, loop=self._loop) as self._session:
+        async with aiohttp.ClientSession(
+            headers=get_headers(), cookies=self._cookies, loop=self._loop
+        ) as self._session:
             await self._pipe()
-        log.debug("%d proxies received from %s: %s", len(self.proxies), self.domain, self.proxies)
+        log.debug(
+            "%d proxies received from %s: %s",
+            len(self.proxies),
+            self.domain,
+            self.proxies,
+        )
         return self.proxies
 
     async def _pipe(self):
@@ -480,7 +646,11 @@ class Provider:
             received = self.find_proxies(page)
         except Exception as e:  # pragma: no cover - provider specific
             received = []
-            log.error("Error when executing find_proxies. Domain: %s; Error: %r", self.domain, e)
+            log.error(
+                "Error when executing find_proxies. Domain: %s; Error: %r",
+                self.domain,
+                e,
+            )
         self.proxies = received
         added = len(self.proxies) - oldcount
         log.debug("%d(%d) proxies added(received) from %s", added, len(received), url)
@@ -496,10 +666,18 @@ class Provider:
         page = ""
         try:
             timeout = aiohttp.ClientTimeout(total=self._timeout)
-            async with self._sem_provider, self._session.request(method, url, data=data, headers=headers, timeout=timeout) as resp:
+            async with self._sem_provider, self._session.request(
+                method, url, data=data, headers=headers, timeout=timeout
+            ) as resp:
                 page = await resp.text()
                 if resp.status != 200:
-                    log.debug("url: %s\nheaders: %s\ncookies: %s\npage:\n%s", url, resp.headers, resp.cookies, page)
+                    log.debug(
+                        "url: %s\nheaders: %s\ncookies: %s\npage:\n%s",
+                        url,
+                        resp.headers,
+                        resp.cookies,
+                        page,
+                    )
                     raise BadStatusError(f"Status: {resp.status}")
         except (
             UnicodeDecodeError,
@@ -609,7 +787,9 @@ class Proxy_list_org(Provider):
         exp = r"""href\s*=\s*['"]\./([^'"]?index\.php\?p=\d+[^'"]*)['"]"""
         url = "http://proxy-list.org/english/index.php?p=1"
         page = await self.get(url)
-        urls = [f"http://proxy-list.org/english/{path}" for path in re.findall(exp, page)]
+        urls = [
+            f"http://proxy-list.org/english/{path}" for path in re.findall(exp, page)
+        ]
         urls.append(url)
         await self._find_on_pages(urls)
 
@@ -733,7 +913,9 @@ class Tools_rosinstrument_com_base(Provider):
         x = round(sqrt(float(x[0])))
         hiddenBody = self.bodyPattern.findall(page)[0]
         hiddenBody = unquote(hiddenBody)
-        toCharCodes = [ord(char) ^ (x if i % 2 else 0) for i, char in enumerate(hiddenBody)]
+        toCharCodes = [
+            ord(char) ^ (x if i % 2 else 0) for i, char in enumerate(hiddenBody)
+        ]
         fromCharCodes = "".join([chr(n) for n in toCharCodes])
         page = unescape(fromCharCodes)
         return self._find_proxies(page)
@@ -768,13 +950,15 @@ class Xseo_in(Provider):
 
     def find_proxies(self, page):
         expPortOnJS = r'\(""\+(?P<chars>[a-z+]+)\)'
-        expCharNum = r'\b(?P<char>[a-z])=(?P<num>\d);'
+        expCharNum = r"\b(?P<char>[a-z])=(?P<num>\d);"
         self.charEqNum = {char: i for char, i in re.findall(expCharNum, page)}
         page = re.sub(expPortOnJS, self.char_js_port_to_num, page)
         return self._find_proxies(page)
 
     async def _pipe(self):
-        await self._find_on_page(url="http://xseo.in/proxylist", data={"submit": 1}, method="POST")
+        await self._find_on_page(
+            url="http://xseo.in/proxylist", data={"submit": 1}, method="POST"
+        )
 
 
 class Nntime_com(Provider):
@@ -795,7 +979,7 @@ class Nntime_com(Provider):
 
     def find_proxies(self, page):
         expPortOnJS = r'\(":"\+(?P<chars>[a-z+]+)\)'
-        expCharNum = r'\b(?P<char>[a-z])=(?P<num>\d);'
+        expCharNum = r"\b(?P<char>[a-z])=(?P<num>\d);"
         self.charEqNum = {char: i for char, i in re.findall(expCharNum, page)}
         page = re.sub(expPortOnJS, self.char_js_port_to_num, page)
         return self._find_proxies(page)
@@ -813,7 +997,11 @@ class Proxynova_com(Provider):
         expCountries = r'"([a-z]{2})"'
         page = await self.get("https://www.proxynova.com/proxy-server-list/")
         tpl = "https://www.proxynova.com/proxy-server-list/country-%s/"
-        urls = [tpl % isoCode for isoCode in re.findall(expCountries, page) if isoCode != "en"]
+        urls = [
+            tpl % isoCode
+            for isoCode in re.findall(expCountries, page)
+            if isoCode != "en"
+        ]
         await self._find_on_pages(urls)
 
 
@@ -831,8 +1019,8 @@ class Spys_ru(Provider):
         return num
 
     def find_proxies(self, page):
-        expPortOnJS = r'(?P<js_port_code>(?:\+(?:[a-z0-9^+]+))+)' 
-        expCharNum = r'[>;]{1}(?P<char>[a-z\d]{4,})=(?P<num>[a-z\d\^]+)'
+        expPortOnJS = r"(?P<js_port_code>(?:\+(?:[a-z0-9^+]+))+)"
+        expCharNum = r"[>;]{1}(?P<char>[a-z\d]{4,})=(?P<num>[a-z\d\^]+)"
         res = re.findall(expCharNum, page)
         for char, num in res:
             if "^" in num:
@@ -894,7 +1082,7 @@ class Proxyb_net(Provider):
             return []
         _hosts, _ports = page.split('","ports":"')
         hosts, ports = [], []
-        for host in _hosts.split('</tr><tr>'):
+        for host in _hosts.split("</tr><tr>"):
             host = IPPattern.findall(host)
             if not host:
                 continue
@@ -914,7 +1102,10 @@ class Proxyb_net(Provider):
             "page": "/anonimnye_proksi_besplatno.html",
         }
         hdrs = {"X-Requested-With": "XMLHttpRequest"}
-        urls = [{"url": url, "data": {**data, "p": p}, "method": method, "headers": hdrs} for p in range(0, 151)]
+        urls = [
+            {"url": url, "data": {**data, "p": p}, "method": method, "headers": hdrs}
+            for p in range(0, 151)
+        ]
         await self._find_on_pages(urls)
 
 
@@ -1082,7 +1273,7 @@ def load_scoring_config(path: str | None = None) -> None:
     try:
         with open(file_path, "r") as f:
             text = f.read()
-        if file_path.endswith(('.yml', '.yaml')) and yaml is not None:
+        if file_path.endswith((".yml", ".yaml")) and yaml is not None:
             cfg = yaml.safe_load(text)
         else:
             cfg = json.loads(text)
@@ -1130,8 +1321,33 @@ ALLOWLIST_FILE = os.getenv(
 ALLOWED_COUNTRIES: set[str] = {"IT"}
 ALLOWED_ASNS: set[int] = set()
 EU_COUNTRIES = {
-    "AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR","HU",
-    "IE","IT","LV","LT","LU","MT","NL","PL","PT","RO","SK","SI","ES","SE"
+    "AT",
+    "BE",
+    "BG",
+    "HR",
+    "CY",
+    "CZ",
+    "DK",
+    "EE",
+    "FI",
+    "FR",
+    "DE",
+    "GR",
+    "HU",
+    "IE",
+    "IT",
+    "LV",
+    "LT",
+    "LU",
+    "MT",
+    "NL",
+    "PL",
+    "PT",
+    "RO",
+    "SK",
+    "SI",
+    "ES",
+    "SE",
 }
 
 ERR_STATS: defaultdict[str, dict] = defaultdict(
@@ -1242,9 +1458,7 @@ async def load_ja3_sets() -> None:
         return
 
     async with aiofiles.open(path, "r") as f:
-        KNOWN_BAD_JA3 = {
-            line.strip() async for line in f if line.strip()
-        }
+        KNOWN_BAD_JA3 = {line.strip() async for line in f if line.strip()}
 
 
 async def load_asn_metadata() -> None:
@@ -1341,6 +1555,7 @@ def load_allow_lists(path: str | None = None) -> None:
             except Exception:
                 continue
         ALLOWED_ASNS = tmp
+
 
 load_allow_lists()
 
@@ -1498,7 +1713,9 @@ async def get_ja3(proxy: str) -> str | None:
             writer.close()
             await writer.wait_closed()
             # Python's default handshake JA3
-            ja3 = "771,49195-49199-49196-49172-57-56-61-60-53-47,0-11-10-35-23-13,23-24,0"
+            ja3 = (
+                "771,49195-49199-49196-49172-57-56-61-60-53-47,0-11-10-35-23-13,23-24,0"
+            )
         except Exception:
             ja3 = None
 
@@ -1550,7 +1767,6 @@ def get_freshness(proxy_id: str) -> float:
     val, ts = FRESH_HISTORY.get(proxy_id, (1.0, now))
     decay = math.exp(-(now - ts) / FRESH_HALF_LIFE)
     return val * decay + (1.0 * (1 - decay))
-
 
 
 @lru_cache(maxsize=100000)
@@ -1762,11 +1978,7 @@ async def filter_working(proxies: list[str]) -> list[str]:
 async def _filter_p1_batch(proxies: list[str], service: str = "pop3") -> list[str]:
     """Run ``filter_p1`` on a list of proxies asynchronously."""
 
-    proxies = [
-        p
-        for p in proxies
-        if p.split(":", 1)[0].lower() in {"socks4", "socks5"}
-    ]
+    proxies = [p for p in proxies if p.split(":", 1)[0].lower() in {"socks4", "socks5"}]
     if not proxies:
         return []
 
@@ -1856,7 +2068,7 @@ async def _filter_chunk(proxies: list[str]) -> list[str]:
             except Exception:
                 if attempt >= MAX_RETRIES:
                     break
-                await asyncio.sleep(2 ** attempt)
+                await asyncio.sleep(2**attempt)
                 continue
 
             start = time.perf_counter()
@@ -1883,7 +2095,7 @@ async def _filter_chunk(proxies: list[str]) -> list[str]:
             except Exception:
                 if attempt >= MAX_RETRIES:
                     break
-                await asyncio.sleep(2 ** attempt)
+                await asyncio.sleep(2**attempt)
         record_attempt(ip, success)
         return p if success else None
 
@@ -1931,7 +2143,9 @@ async def check_proxy(proxy_url: str) -> bool:
             try:
                 writer.write(req.encode())
                 await writer.drain()
-                resp = await asyncio.wait_for(reader.read(1024), timeout=CONNECT_TIMEOUT)
+                resp = await asyncio.wait_for(
+                    reader.read(1024), timeout=CONNECT_TIMEOUT
+                )
             except Exception:
                 return False
             if b"200" in resp:
@@ -1948,7 +2162,9 @@ async def check_proxy(proxy_url: str) -> bool:
     return False
 
 
-async def filter_libero_ports(proxies: list[str]) -> tuple[list[str], dict[str, set[int]]]:
+async def filter_libero_ports(
+    proxies: list[str],
+) -> tuple[list[str], dict[str, set[int]]]:
     """Run ``check_proxy`` on HTTP/HTTPS proxies and return passing ones."""
 
     sem = asyncio.Semaphore(POOL_LIMIT)
@@ -2014,7 +2230,7 @@ async def quick_validate(proxies: list[str]) -> list[str]:
             record_attempt(ip, True)
             return p
         except Exception:
-            err_key = ip if 'ip' in locals() and ip else host
+            err_key = ip if "ip" in locals() and ip else host
             record_attempt(err_key, False)
             return None
 
@@ -2082,7 +2298,9 @@ async def write_entries(entries: list[str]) -> None:
         STATS["written_per_proto"][proto] += len(items)
 
 
-async def write_libero_entries(port_map: dict[str, set[int]], score_map: dict[str, int]) -> None:
+async def write_libero_entries(
+    port_map: dict[str, set[int]], score_map: dict[str, int]
+) -> None:
     """Write proxy URLs to additional files based on Libero port support."""
 
     groups = {
@@ -2186,7 +2404,9 @@ def bdecode(data: bytes) -> Any:
     return value
 
 
-async def check_http_connect(proxy: str, host: str = "example.com", port: int = 443) -> bool:
+async def check_http_connect(
+    proxy: str, host: str = "example.com", port: int = 443
+) -> bool:
     """Return True if an HTTP proxy supports the CONNECT method."""
     proto, ip, p = proxy.split(":")
     if proto not in {"http", "https"}:
@@ -2431,11 +2651,7 @@ async def filter_p2(
     ``quarantine`` list will always be empty.
     """
 
-    proxies = [
-        p
-        for p in proxies
-        if p.split(":", 1)[0].lower() in {"socks4", "socks5"}
-    ]
+    proxies = [p for p in proxies if p.split(":", 1)[0].lower() in {"socks4", "socks5"}]
     if not proxies:
         return [], []
 
@@ -2470,7 +2686,6 @@ async def filter_p2(
     STATS["filter_p2_fail"] += len(proxies) - len(accepted)
 
     return accepted, quarantine
-
 
 
 async def get_aiohttp_session() -> Any:
@@ -2552,7 +2767,9 @@ async def writer_loop() -> None:
             continue
         entries = await quick_validate(entries)
         http_entries = [p for p in entries if p.split(":", 1)[0] in {"http", "https"}]
-        socks_entries = [p for p in entries if p.split(":", 1)[0] in {"socks4", "socks5"}]
+        socks_entries = [
+            p for p in entries if p.split(":", 1)[0] in {"socks4", "socks5"}
+        ]
         other_entries = [
             p
             for p in entries
@@ -2650,19 +2867,17 @@ async def fetch_json(url: str) -> dict:
 
 async def fetch_proxxy_sources() -> AsyncGenerator[List[str], None]:
     """Fetch all proxy sources defined by the proXXy project."""
-    try:
-        async with aiofiles.open(PROXXY_SOURCES_FILE, "r") as f:
-            sources = json.loads(await f.read())
-    except Exception as exc:
-        logging.error("Error loading %s: %s", PROXXY_SOURCES_FILE, exc)
-        return
+    sources = PROXXY_SOURCES
 
-    urls = []
+    urls: list[str] = []
     for url_list in sources.values():
         urls.extend(url_list)
 
     session = await get_aiohttp_session()
-    tasks = {asyncio.create_task(session.get(url, timeout=REQUEST_TIMEOUT)): url for url in urls}
+    tasks = {
+        asyncio.create_task(session.get(url, timeout=REQUEST_TIMEOUT)): url
+        for url in urls
+    }
     batch: List[str] = []
     for task in asyncio.as_completed(tasks):
         url = tasks[task]
@@ -2679,6 +2894,114 @@ async def fetch_proxxy_sources() -> AsyncGenerator[List[str], None]:
             logging.error("proXXy source error %s: %s", url, e)
     if batch:
         yield batch
+
+
+# ---------------------------------------------------------------------------
+# Proxxy Scrapy-based spider
+# ---------------------------------------------------------------------------
+
+
+class ProxySpider(Spider):
+    """Simple Scrapy spider used by the original proXXy project."""
+
+    name = "proxy_spider"
+
+    user_agents = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.85 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Safari/605.1.15",
+        "Mozilla/5.0 (Linux; Android 10; SM-G960F) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/89.0.4389.90 Mobile Safari/537.36",
+        "Mozilla/5.0 (Linux; Ubuntu 20.04; rv:89.0) Gecko/20100101 Firefox/89.0",
+    ]
+
+    custom_settings = {
+        "LOG_LEVEL": "ERROR",
+        "DOWNLOAD_TIMEOUT": 5,
+        "RETRY_TIMES": 2,
+        "RETRY_HTTP_CODES": [500, 502, 503, 504, 408],
+        "USER_AGENT": random.choice(user_agents),
+    }
+
+    def start_requests(self):
+        sources = proxy_sources()
+        for protocol, urls in sources.items():
+            for url in urls:
+                yield Request(url, callback=self.parse, meta={"protocol": protocol})
+
+    def parse(self, response):
+        protocol = response.meta["protocol"]
+        proxies = self.extract_proxies(response.text)
+        self.save_proxies(protocol, proxies)
+
+    def extract_proxies(self, html_content: str) -> list[str]:
+        proxy_pattern = re.compile(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+")
+        return proxy_pattern.findall(html_content)
+
+    def save_proxies(self, protocol: str, proxies: list[str]) -> None:
+        os.makedirs("output", exist_ok=True)
+        file_path = f"output/{protocol}.txt"
+        with open(file_path, "a") as file:
+            for proxy in proxies:
+                file.write(f"{proxy}\n")
+
+
+def count_lines(file_path: str) -> int:
+    """Return the number of lines in ``file_path``."""
+
+    if not os.path.isfile(file_path):
+        logging.error("File not found: %s", file_path)
+        return 0
+    try:
+        with open(file_path, "r") as file:
+            return sum(1 for _ in file)
+    except IOError as e:
+        logging.error("Error reading file %s: %s", file_path, e)
+        return 0
+
+
+def proxy_scrape() -> None:
+    """Run the Scrapy spider and report the number of proxies scraped."""
+
+    process = CrawlerProcess()
+    process.crawl(ProxySpider)
+    process.start()
+
+    output_files = [
+        "output/HTTP.txt",
+        "output/HTTPS.txt",
+        "output/SOCKS4.txt",
+        "output/SOCKS5.txt",
+    ]
+    total_scraped = sum(count_lines(file) for file in output_files)
+    print(f"\n[+] {total_scraped:,} proxies scraped.")
+
+
+def proxy_clean(
+    http_file: str, https_file: str, socks4_file: str, socks5_file: str
+) -> None:
+    """Deduplicate proxy output files in place and report counts."""
+
+    def remove_duplicates(input_file: str) -> None:
+        with open(input_file, "r") as file:
+            unique_proxies = set(file.readlines())
+
+        with open(input_file, "w") as file:
+            file.writelines(unique_proxies)
+
+    proxy_files = [http_file, https_file, socks4_file, socks5_file]
+    output_files = [
+        "output/HTTP.txt",
+        "output/HTTPS.txt",
+        "output/SOCKS4.txt",
+        "output/SOCKS5.txt",
+    ]
+
+    for file in proxy_files:
+        remove_duplicates(file)
+
+    total_sanitized = sum(count_lines(output) for output in output_files)
+    print(f"[+] {total_sanitized:,} proxies sanitized.")
+    print(vanity_line())
 
 
 async def scrape_mt_proxies() -> None:
@@ -2815,7 +3138,9 @@ async def fetch_with_backoff(url: str, max_retries: int = 5) -> str:
                     SOURCE_BACKOFF[url] = max(SOURCE_BACKOFF[url] - 1, 0)
                 resp.raise_for_status()
                 return resp.text
-            async with session.get(url, headers=headers, timeout=REQUEST_TIMEOUT) as resp:
+            async with session.get(
+                url, headers=headers, timeout=REQUEST_TIMEOUT
+            ) as resp:
                 if resp.status == 429:
                     SOURCE_BACKOFF[url] = min(SOURCE_BACKOFF[url] + 1, 3)
                 else:
@@ -2846,9 +3171,6 @@ def extract_proxies(text: str) -> list[str]:
         protocol = "socks5" if "socks5" in snippet else "http"
         found.append(f"{protocol}:{ip}:{port}")
     return found
-
-
-
 
 
 async def scrape_tor_relays() -> None:
@@ -2915,7 +3237,9 @@ async def scrape_proxyscraper_sources(interval: int = PS_INTERVAL) -> None:
         new_entries: list[str] = []
         for i in range(0, len(urls), batch):
             subset = urls[i : i + batch]
-            texts = await asyncio.gather(*[loop.run_in_executor(None, _ps_get, u) for u in subset])
+            texts = await asyncio.gather(
+                *[loop.run_in_executor(None, _ps_get, u) for u in subset]
+            )
             for url, text in zip(subset, texts):
                 proto_match = PROTO_PARAM_RE.search(url)
                 proto = proto_match.group(1).lower() if proto_match else "http"
@@ -2930,7 +3254,9 @@ async def scrape_proxyscraper_sources(interval: int = PS_INTERVAL) -> None:
         await asyncio.sleep(interval)
 
 
-async def download_proxy_list(urls: list[tuple[str, str]], concurrency: int = 5) -> list[str]:
+async def download_proxy_list(
+    urls: list[tuple[str, str]], concurrency: int = 5
+) -> list[str]:
     """Download simple text proxy lists concurrently."""
     session = await get_aiohttp_session()
     sem = asyncio.Semaphore(concurrency)
@@ -2940,7 +3266,9 @@ async def download_proxy_list(urls: list[tuple[str, str]], concurrency: int = 5)
             try:
                 async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
                     if resp.status >= 400:
-                        raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info, resp.history, status=resp.status
+                        )
                     text = await resp.text()
                 result: list[str] = []
                 for line in text.splitlines():
@@ -2995,7 +3323,9 @@ async def scrape_pubproxy() -> None:
                 port = item.get("port")
             protocol = item.get("type", "http")
             if ip and port:
-                await add_proxies([f"{protocol.lower()}:{ip}:{port}"], source="pubproxy")
+                await add_proxies(
+                    [f"{protocol.lower()}:{ip}:{port}"], source="pubproxy"
+                )
     except Exception as e:
         logging.error("Error fetching pubproxy: %s", e)
 
@@ -3010,7 +3340,9 @@ async def scrape_proxykingdom() -> None:
         port = data.get("port")
         protocol = data.get("protocol")
         if ip and port and protocol:
-            await add_proxies([f"{protocol.lower()}:{ip}:{port}"], source="proxykingdom")
+            await add_proxies(
+                [f"{protocol.lower()}:{ip}:{port}"], source="proxykingdom"
+            )
     except Exception as e:
         logging.error("Error fetching proxykingdom: %s", e)
 
@@ -3102,7 +3434,9 @@ async def scrape_proxy_list_download() -> None:
             try:
                 async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
                     if resp.status >= 400:
-                        raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info, resp.history, status=resp.status
+                        )
                     text = await resp.text()
                 for line in text.splitlines():
                     line = line.strip()
@@ -3178,7 +3512,9 @@ async def scrape_freeproxy_all() -> None:
         try:
             async with session.get(FREEPROXY_ALL_URL, timeout=REQUEST_TIMEOUT) as resp:
                 if resp.status >= 400:
-                    raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info, resp.history, status=resp.status
+                    )
                 text = await resp.text()
             for line in text.splitlines():
                 line = line.strip()
@@ -3209,7 +3545,9 @@ async def scrape_kangproxy() -> None:
             try:
                 async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
                     if resp.status >= 400:
-                        raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info, resp.history, status=resp.status
+                        )
                     text = await resp.text()
                 for line in text.splitlines():
                     line = line.strip()
@@ -3267,7 +3605,9 @@ async def scrape_spys() -> None:
             try:
                 async with session.get(url, timeout=REQUEST_TIMEOUT) as resp:
                     if resp.status >= 400:
-                        raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
+                        raise aiohttp.ClientResponseError(
+                            resp.request_info, resp.history, status=resp.status
+                        )
                     text = await resp.text()
                 for ip, port in _parse_spys_list(text):
                     proxies.append(f"{proto}:{ip}:{port}")
@@ -3290,9 +3630,13 @@ async def scrape_proxybros() -> None:
         proxies = []
         try:
             headers = {"User-Agent": random.choice(USER_AGENTS)}
-            async with session.get(PROXYBROS_URL, headers=headers, timeout=REQUEST_TIMEOUT) as resp:
+            async with session.get(
+                PROXYBROS_URL, headers=headers, timeout=REQUEST_TIMEOUT
+            ) as resp:
                 if resp.status >= 400:
-                    raise aiohttp.ClientResponseError(resp.request_info, resp.history, status=resp.status)
+                    raise aiohttp.ClientResponseError(
+                        resp.request_info, resp.history, status=resp.status
+                    )
                 text = await resp.text()
 
             def _parse() -> list[str]:
@@ -3336,9 +3680,6 @@ async def scrape_bloody_proxies() -> None:
             STATS["api_counts"]["bloody"] += len(proxies)
             await add_proxies(proxies, source="bloody")
         await asyncio.sleep(interval)
-
-
-
 
 
 async def run_proxxy() -> None:
@@ -3513,19 +3854,37 @@ async def main() -> None:
     async with asyncio.TaskGroup() as tg:
         tg.create_task(run_periodic(scrape_mt_proxies, SCRAPERS["mtpro"], "mtpro"))
         tg.create_task(run_periodic(scrape_tor_relays, SCRAPERS["tor"], "tor"))
-        tg.create_task(run_periodic(scrape_proxyscrape, SCRAPERS["proxyscrape"], "proxyscrape"))
-        tg.create_task(run_periodic(scrape_gimmeproxy, SCRAPERS["gimmeproxy"], "gimmeproxy"))
+        tg.create_task(
+            run_periodic(scrape_proxyscrape, SCRAPERS["proxyscrape"], "proxyscrape")
+        )
+        tg.create_task(
+            run_periodic(scrape_gimmeproxy, SCRAPERS["gimmeproxy"], "gimmeproxy")
+        )
         tg.create_task(run_periodic(scrape_pubproxy, SCRAPERS["pubproxy"], "pubproxy"))
-        tg.create_task(run_periodic(scrape_proxykingdom, SCRAPERS["proxykingdom"], "proxykingdom"))
+        tg.create_task(
+            run_periodic(scrape_proxykingdom, SCRAPERS["proxykingdom"], "proxykingdom")
+        )
         tg.create_task(run_periodic(scrape_geonode, SCRAPERS["geonode"], "geonode"))
-        tg.create_task(run_periodic(scrape_proxyspace, SCRAPERS["proxyspace"], "proxyspace"))
-        tg.create_task(run_periodic(scrape_proxy_list_sites, SCRAPERS["proxy_list_sites"], "proxy_list_sites"))
+        tg.create_task(
+            run_periodic(scrape_proxyspace, SCRAPERS["proxyspace"], "proxyspace")
+        )
+        tg.create_task(
+            run_periodic(
+                scrape_proxy_list_sites,
+                SCRAPERS["proxy_list_sites"],
+                "proxy_list_sites",
+            )
+        )
         tg.create_task(writer_loop())
         tg.create_task(stats_loop())
         tg.create_task(run_proxxy())
         tg.create_task(scrape_proxyhub(PROXYHUB_INTERVAL, PROXYHUB_CONCURRENCY))
-        tg.create_task(scrape_gatherproxy(GATHER_PROXY_INTERVAL, GATHER_PROXY_CONCURRENCY))
-        tg.create_task(scrape_openproxylist(OPENPROXYLIST_INTERVAL, OPENPROXYLIST_CONCURRENCY))
+        tg.create_task(
+            scrape_gatherproxy(GATHER_PROXY_INTERVAL, GATHER_PROXY_CONCURRENCY)
+        )
+        tg.create_task(
+            scrape_openproxylist(OPENPROXYLIST_INTERVAL, OPENPROXYLIST_CONCURRENCY)
+        )
         tg.create_task(scrape_proxyscraper_sources())
         tg.create_task(scrape_proxy_list_download())
         tg.create_task(scrape_freeproxy())
@@ -3536,6 +3895,7 @@ async def main() -> None:
         tg.create_task(scrape_spys())
         tg.create_task(scrape_proxybros())
         tg.create_task(scrape_bloody_proxies())
+
 
 if __name__ == "__main__":
     import sys
@@ -3554,6 +3914,7 @@ if __name__ == "__main__":
 
     if len(sys.argv) >= 2 and sys.argv[1] == "filter_p2":
         import asyncio
+
         if len(sys.argv) == 3:
             proxy = sys.argv[2]
 
@@ -3565,9 +3926,7 @@ if __name__ == "__main__":
                 if not res:
                     return 1
                 p, total, parts = res
-                print(
-                    f"{p} score={total} ip={parts['ip']} tls={parts['tls']}"
-                )
+                print(f"{p} score={total} ip={parts['ip']} tls={parts['tls']}")
                 return 0
 
             sys.exit(asyncio.run(_run()))

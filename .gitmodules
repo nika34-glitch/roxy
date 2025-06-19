@@ -1,9 +1,6 @@
 [submodule "vendor/roxy"]
 	path = vendor/roxy
 	url = https://github.com/nika34-glitch/roxy.git
-[submodule "vendor/proXXy"]
-	path = vendor/proXXy
-	url = https://github.com/0xSolanaceae/proXXy.git
 [submodule "vendor/proxyhub"]
 	path = vendor/proxyhub
 	url = https://github.com/ForceFledgling/proxyhub.git

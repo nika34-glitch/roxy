@@ -88,3 +88,35 @@ def test_collect_proxies_by_type(monkeypatch, tmp_path):
     asyncio.run(sp.save_proxies_json(str(out)))
     saved = json.loads(out.read_text())
     assert saved == res
+
+
+def test_dedup_across_sources(monkeypatch):
+    sp = importlib.import_module("scrape_proxies")
+    mapping = {
+        "http://a": "1.1.1.1:1\n2.2.2.2:2\n",
+        "http://b": "2.2.2.2:2\n3.3.3.3:3\n",
+    }
+    monkeypatch.setattr(sp, "PROXXY_SOURCES", {"HTTP": ["http://a", "http://b"]})
+
+    async def fake_session():
+        return MapSession(mapping)
+
+    monkeypatch.setattr(sp, "get_aiohttp_session", fake_session)
+
+    res = asyncio.run(sp.collect_proxies_by_type())
+    assert res == {"HTTP": ["1.1.1.1:1", "2.2.2.2:2", "3.3.3.3:3"]}
+
+    def fake_as_completed(iterable):
+        for item in iterable:
+            yield item
+
+    monkeypatch.setattr(asyncio, "as_completed", fake_as_completed)
+
+    async def run():
+        out = []
+        async for batch in sp.fetch_proxxy_sources():
+            out.extend(batch)
+        return out
+
+    proxies = asyncio.run(run())
+    assert proxies == ["1.1.1.1:1", "2.2.2.2:2", "3.3.3.3:3"]

@@ -1,0 +1,6 @@
+{
+    "HTTP": ["https://example.com/http.txt"],
+    "HTTPS": ["https://example.com/https.txt"],
+    "SOCKS4": ["https://example.com/socks4.txt"],
+    "SOCKS5": ["https://example.com/socks5.txt"]
+}

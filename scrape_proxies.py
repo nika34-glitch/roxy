@@ -21,6 +21,8 @@ __all__ = [
     "bencode",
     "bdecode",
     "PROXXY_SOURCES",
+    "load_proxy_sources",
+    "save_proxy_sources",
     "get_aiohttp_session",
     "fetch_proxxy_sources",
     "ProxySpider",
@@ -261,7 +263,33 @@ def bdecode(data: bytes) -> Any:
 # ---------------------------------------------------------------------------
 # ProXXy sources and spider
 # ---------------------------------------------------------------------------
-PROXXY_SOURCES = {
+PROXY_SOURCES_FILE = Path(__file__).resolve().parent / "proxy_sources.json"
+
+
+def load_proxy_sources(path: str | Path = PROXY_SOURCES_FILE) -> dict[str, list[str]]:
+    """Load mapping of proxy source URLs from ``path``.
+
+    The JSON file should contain a dictionary where the keys are proxy types
+    (e.g. ``HTTP`` or ``SOCKS5``) and the values are lists of URLs.  If the file
+    is missing or invalid an empty dictionary is returned.
+    """
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {str(k).upper(): list(v) for k, v in data.items()}
+    except Exception as exc:  # pragma: no cover - invalid config
+        _log.error("failed to load proxy sources %s: %s", path, exc)
+    return {}
+
+
+def save_proxy_sources(path: str | Path = PROXY_SOURCES_FILE) -> None:
+    """Write :data:`PROXXY_SOURCES` to ``path`` sorted by proxy type."""
+    with open(path, "w") as f:
+        json.dump({k: PROXXY_SOURCES[k] for k in sorted(PROXXY_SOURCES)}, f, indent=2)
+
+
+PROXXY_SOURCES = load_proxy_sources() or {
     "HTTP": ["https://example.com/http.txt"],
     "HTTPS": ["https://example.com/https.txt"],
     "SOCKS4": ["https://example.com/socks4.txt"],

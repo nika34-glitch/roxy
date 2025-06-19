@@ -8,8 +8,12 @@ import json
 import gzip
 import ssl
 import functools
+import signal
+import time
+import argparse
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, AsyncGenerator, Any
+from typing import List, AsyncGenerator, Any, Dict
 
 __all__ = [
     "fetch_proxies",
@@ -31,7 +35,13 @@ __all__ = [
     "CRITICAL_MIN",
     "OVERALL_MIN",
     "WEIGHTS",
-    "filter_p2",
+    "filter1",
+    "scrape",
+    "classify",
+    "check_tls",
+    "write_files",
+    "print_stats",
+    "main",
 ]
 
 _log = logging.getLogger(__name__)
@@ -88,6 +98,35 @@ load_scoring_config()
 # Utility helpers
 # ---------------------------------------------------------------------------
 PROTOCOL_RE = re.compile(r"^(https?|socks4|socks5)$", re.I)
+
+TYPES = ["http", "https", "socks4", "socks5"]
+
+
+@dataclass
+class Stats:
+    """In-memory counters for proxy scraping and testing."""
+
+    total: int = 0
+    passed_filter1: int = 0
+    per_type: Dict[str, int] = field(default_factory=lambda: {t: 0 for t in TYPES})
+    working: Dict[str, int] = field(default_factory=lambda: {t: 0 for t in TYPES})
+    dead: Dict[str, int] = field(default_factory=lambda: {t: 0 for t in TYPES})
+    start: float = field(default_factory=time.monotonic)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "total": self.total,
+            "passed_filter1": self.passed_filter1,
+            "types": {
+                t: {
+                    "total": self.per_type[t],
+                    "working": self.working[t],
+                    "dead": self.dead[t],
+                }
+                for t in TYPES
+            },
+            "elapsed": time.monotonic() - self.start,
+        }
 
 @functools.lru_cache(maxsize=100000)
 def normalize_proxy(entry: str) -> str | None:
@@ -358,45 +397,96 @@ class ProxySpider(Spider):
                 f.write(p + "\n")
 
 # ---------------------------------------------------------------------------
-# Scoring helpers used by filter_p2
+# Scoring helpers used by filter1
 # ---------------------------------------------------------------------------
-async def load_blacklists() -> None:
-    return None
 
-async def _score_single_proxy(p: str, ctx: ssl.SSLContext, return_all: bool = False):
-    return None
+# Keep in-memory blacklist loaded from optional file
+BLACKLIST: set[str] = set()
 
-async def filter_p2(proxies: List[str]) -> tuple[List[tuple[str, int]], List[tuple[str, int]]]:
-    proxies = [p for p in proxies if p.split(":", 1)[0].lower() in {"socks4", "socks5"}]
+
+async def load_blacklists(path: str | None = None) -> None:
+    """Load blacklist entries from *path* into ``BLACKLIST`` if available."""
+
+    global BLACKLIST
+    BLACKLIST.clear()
+    file_path = path or os.getenv(
+        "BLACKLIST_PATH",
+        str(Path(__file__).resolve().parent / "data" / "blacklist.txt"),
+    )
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        BLACKLIST.add(line)
+        except Exception as exc:  # pragma: no cover - optional file errors
+            _log.error("error loading blacklist %s: %s", file_path, exc)
+
+
+async def _score_single_proxy(
+    p: str, ctx: ssl.SSLContext, timeout: float, return_all: bool = False
+) -> tuple[str, int, dict[str, int]] | None:
+    """Return proxy score and component parts.
+
+    This simplified scorer only checks blacklist membership and TLS reachability.
+    ``ip_rep`` is treated as a constant weight for all proxies.
+    """
+
+    proto, host, port_str = p.split(":", 2)
+    parts: dict[str, int] = {}
+
+    if host in BLACKLIST:
+        parts["critical"] = 0
+        return (p, 0, parts) if return_all else None
+
+    tls_ok = await check_tls(f"{host}:{port_str}", proto, timeout)
+    critical = WEIGHTS.get("tls_reach", 0) if tls_ok else 0
+    parts["critical"] = critical
+
+    score = critical + WEIGHTS.get("ip_rep", 0)
+
+    return (p, score, parts) if return_all else (p, score, parts)
+
+
+async def filter1(
+    proxies: List[str], timeout: float = 5.0, concurrency: int = 5000
+) -> List[str]:
+    """Filter *proxies* using TLS reachability and scoring thresholds."""
+
+    proxies = [
+        p
+        for p in proxies
+        if p.split(":", 1)[0].lower() in {"http", "https", "socks4", "socks5"}
+    ]
     if not proxies:
-        return [], []
+        return []
+
     await load_blacklists()
+
     ctx = ssl.create_default_context()
     ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
-    async def score(p: str) -> tuple[str, int, dict[str, int]]:
-        res = await _score_single_proxy(p, ctx, return_all=True)
-        assert res is not None
-        return res
+    sem = asyncio.Semaphore(concurrency)
+    good: List[str] = []
 
-    tasks = [asyncio.create_task(score(p)) for p in proxies]
-    scored: List[tuple[str, int, dict[str, int]]] = []
-    for t in asyncio.as_completed(tasks):
-        try:
-            res = await t
-            if res:
-                scored.append(res)
-        except Exception:
-            continue
-    accepted: List[tuple[str, int]] = []
-    quarantine: List[tuple[str, int]] = []
-    for norm, score, parts in scored:
+    async def worker(p: str) -> None:
+        async with sem:
+            res = await _score_single_proxy(p, ctx, timeout, return_all=True)
+        if res is None:
+            return
+        norm, score, parts = res
         crit = parts.get("critical", 0)
         if score >= OVERALL_MIN and crit >= CRITICAL_MIN:
-            accepted.append((norm, score))
+            good.append(norm)
         elif MODE == "lenient" and 500 <= score < 600:
-            quarantine.append((norm, score))
-    return accepted, quarantine
+            # Quarantine feature from former filter_p2 (not returned)
+            pass
+
+    tasks = [asyncio.create_task(worker(p)) for p in proxies]
+    for t in asyncio.as_completed(tasks):
+        await t
+    return good
 
 # ---------------------------------------------------------------------------
 # Minimal async fetcher using HTTP sources
@@ -557,3 +647,169 @@ async def probe_proxies(proxies: List[str], concurrency: int = 10000, timeout: f
         fh.close()
 
     return counts
+
+
+def _check_tls_sync(proxy: str, ptype: str, timeout: float, host: str, port: int) -> bool:
+    try:
+        import socks  # type: ignore
+    except Exception as exc:  # pragma: no cover - missing dependency
+        raise RuntimeError("PySocks required") from exc
+
+    addr = _split_host_port(proxy)
+    if not addr:
+        return False
+    phost, pport = addr
+    sock = socks.socksocket()
+    if ptype == "socks5":
+        sock.set_proxy(socks.SOCKS5, phost, pport)
+    elif ptype == "socks4":
+        sock.set_proxy(socks.SOCKS4, phost, pport)
+    elif ptype in {"http", "https"}:
+        sock.set_proxy(socks.HTTP, phost, pport)
+    sock.settimeout(timeout)
+    try:
+        sock.connect((host, port))
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        wrapped = ctx.wrap_socket(sock, server_hostname=host)
+        wrapped.settimeout(timeout)
+        wrapped.do_handshake()
+        wrapped.close()
+        return True
+    except Exception:
+        try:
+            sock.close()
+        finally:
+            return False
+
+
+async def check_tls(
+    proxy: str,
+    ptype: str,
+    timeout: float = 5.0,
+    target_host: str = "pop.libero.it",
+    target_port: int = 995,
+) -> bool:
+    """Return True if TLS handshake to target succeeds via *proxy*."""
+
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        None, _check_tls_sync, proxy, ptype, timeout, target_host, target_port
+    )
+
+
+async def scrape() -> List[str]:
+    """Collect proxies from all configured sources."""
+
+    data = await collect_proxies_by_type()
+    proxies: List[str] = []
+    for lst in data.values():
+        proxies.extend(lst)
+    return proxies
+
+
+async def classify(proxies: List[str], timeout: float = 2.0) -> List[str]:
+    """Return normalized proxies with detected protocol."""
+
+    result: List[str] = []
+    sem = asyncio.Semaphore(1000)
+
+    async def worker(p: str) -> None:
+        async with sem:
+            kind = await classify_proxy(p, timeout)
+        if kind:
+            result.append(f"{kind}:{p}")
+
+    tasks = [asyncio.create_task(worker(p)) for p in proxies]
+    for t in asyncio.as_completed(tasks):
+        await t
+    return result
+
+
+def write_files(files: Dict[str, Any]) -> None:
+    for fh in files.values():
+        fh.flush()
+        fh.close()
+
+
+async def print_stats(stats: Stats, path: Path) -> None:
+    summary = [f"Total: {stats.total}"]
+    for t in TYPES:
+        summary.append(
+            f"{t}: {stats.per_type[t]} (" \
+            f"{stats.working[t]} working / {stats.dead[t]} dead)"
+        )
+    summary.append(f"Passed filter1: {stats.passed_filter1}")
+    print("[Stats] " + " | ".join(summary))
+    with open(path / "stats.json", "w") as fh:
+        json.dump(stats.to_dict(), fh, indent=2)
+
+
+async def main(argv: List[str] | None = None) -> None:
+    parser = argparse.ArgumentParser(description="Proxy scraper")
+    parser.add_argument("--timeout", type=float, default=5.0, help="TLS handshake timeout")
+    parser.add_argument("--concurrency", type=int, default=5000, help="Maximum simultaneous checks")
+    parser.add_argument("--stats-interval", type=float, default=1.0, help="Seconds between stats output")
+    parser.add_argument("--output-dir", type=str, default=".", help="Directory for output files")
+    args = parser.parse_args(argv)
+
+    out_dir = Path(args.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    files = {t: open(out_dir / f"{t}.txt", "a", buffering=1) for t in TYPES}
+    working_files = {t: open(out_dir / f"{t}_working.txt", "a", buffering=1) for t in TYPES}
+
+    stats = Stats()
+    stop = False
+
+    def _sigint(*_: Any) -> None:
+        nonlocal stop
+        stop = True
+
+    signal.signal(signal.SIGINT, _sigint)
+
+    proxies = await scrape()
+
+    queue: asyncio.Queue[str] = asyncio.Queue()
+    for p in proxies:
+        queue.put_nowait(p)
+
+    sem = asyncio.Semaphore(args.concurrency)
+
+    async def worker() -> None:
+        while not stop:
+            try:
+                proxy = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+
+            stats.total += 1
+            async with sem:
+                kind = await classify_proxy(proxy, timeout=2.0)
+            if not kind:
+                continue
+            stats.per_type[kind] += 1
+            files[kind].write(f"{proxy}\n")
+            ok = await check_tls(proxy, kind, args.timeout)
+            if ok:
+                stats.working[kind] += 1
+                stats.passed_filter1 += 1
+                working_files[kind].write(f"{proxy}\n")
+            else:
+                stats.dead[kind] += 1
+
+    workers = [asyncio.create_task(worker()) for _ in range(args.concurrency)]
+
+    async def stats_loop() -> None:
+        while any(not w.done() for w in workers):
+            await asyncio.sleep(args.stats_interval)
+            await print_stats(stats, out_dir)
+        await print_stats(stats, out_dir)
+
+    await asyncio.gather(asyncio.create_task(stats_loop()), *workers)
+
+    write_files(files)
+    write_files(working_files)
+

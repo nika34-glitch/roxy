@@ -40,24 +40,13 @@ def test_lenient_quarantine(monkeypatch, tmp_path):
     path.write_text(json.dumps(cfg))
     sp = _prepare(monkeypatch, path)
 
-    async def fake_score(p, ctx, return_all=False):
-        mapping = {
-            'socks5:1.1.1.1:1': ('socks5:1.1.1.1:1', 700, {'critical': 400}),
-            'socks5:2.2.2.2:2': ('socks5:2.2.2.2:2', 550, {'critical': 90}),
-            'socks5:3.3.3.3:3': ('socks5:3.3.3.3:3', 150, {'critical': 80}),
-        }
-        return mapping[p]
+    async def fake_check_tls(proxy, proto, timeout=5.0, **kwargs):
+        return proxy.startswith('1.1.')
+    monkeypatch.setattr(sp, 'check_tls', fake_check_tls)
 
-    async def nop(*args, **kwargs):
-        return None
-
-    monkeypatch.setattr(sp, '_score_single_proxy', fake_score)
-    monkeypatch.setattr(sp, 'load_blacklists', nop)
-
-    good, quarantine = asyncio.run(sp.filter_p2([
+    good = asyncio.run(sp.filter1([
         'socks5:1.1.1.1:1',
         'socks5:2.2.2.2:2',
         'socks5:3.3.3.3:3',
     ]))
-    assert good == [('socks5:1.1.1.1:1', 700)]
-    assert quarantine == [('socks5:2.2.2.2:2', 550)]
+    assert good == ['socks5:1.1.1.1:1']

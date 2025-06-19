@@ -21,6 +21,8 @@ __all__ = [
     "bencode",
     "bdecode",
     "PROXXY_SOURCES",
+    "load_proxy_sources",
+    "PROXY_SOURCES_PATH",
     "get_aiohttp_session",
     "fetch_proxxy_sources",
     "collect_proxies_by_type",
@@ -263,12 +265,40 @@ def bdecode(data: bytes) -> Any:
 # ---------------------------------------------------------------------------
 # ProXXy sources and spider
 # ---------------------------------------------------------------------------
-PROXXY_SOURCES = {
-    "HTTP": ["https://example.com/http.txt"],
-    "HTTPS": ["https://example.com/https.txt"],
-    "SOCKS4": ["https://example.com/socks4.txt"],
-    "SOCKS5": ["https://example.com/socks5.txt"],
-}
+
+PROXY_SOURCES_PATH = os.getenv(
+    "PROXY_SOURCES_PATH",
+    str(Path(__file__).resolve().parent / "data" / "proxy_sources.json"),
+)
+
+
+def load_proxy_sources(path: str = PROXY_SOURCES_PATH) -> dict[str, list[str]]:
+    """Return mapping of proxy type to source URLs from *path* if it exists."""
+
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                result = {}
+                for k in ("HTTP", "SOCKS4", "SOCKS5", "HTTPS"):
+                    urls = data.get(k)
+                    if isinstance(urls, list):
+                        result[k] = [str(u) for u in urls]
+                if result:
+                    return result
+        except Exception as exc:  # pragma: no cover - invalid file
+            _log.error("error loading %s: %s", path, exc)
+
+    return {
+        "HTTP": ["https://example.com/http.txt"],
+        "SOCKS4": ["https://example.com/socks4.txt"],
+        "SOCKS5": ["https://example.com/socks5.txt"],
+        "HTTPS": ["https://example.com/https.txt"],
+    }
+
+
+PROXXY_SOURCES = load_proxy_sources()
 
 IP_PORT_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$")
 REQUEST_TIMEOUT = 10

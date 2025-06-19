@@ -1,10 +1,7 @@
 import asyncio
-import importlib.util
 import logging
 import re
 import random
-import sys
-import types
 import ipaddress
 import os
 import json
@@ -30,8 +27,6 @@ __all__ = [
     "collect_proxies_by_type",
     "save_proxies_json",
     "ProxySpider",
-    "SOURCE_LIST",
-    "fetch_source",
     "MODE",
     "CRITICAL_MIN",
     "OVERALL_MIN",
@@ -41,69 +36,7 @@ __all__ = [
 
 _log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# ProxyHub provider loader
-# ---------------------------------------------------------------------------
-_PROVIDER_MODULE = None
 
-def _load_provider_module():
-    """Dynamically load proxyhub's providers module with minimal stubs."""
-    global _PROVIDER_MODULE
-    if _PROVIDER_MODULE is not None:
-        return _PROVIDER_MODULE
-
-    base_path = Path(__file__).resolve().parent / "proxyhub" / "proxyhub" / "providers.py"
-
-    pkg = types.ModuleType("proxyhub")
-    pkg.__path__ = [str(base_path.parent)]
-    sys.modules.setdefault("proxyhub", pkg)
-
-    errors = types.ModuleType("proxyhub.errors")
-    class BadStatusError(Exception):
-        pass
-    errors.BadStatusError = BadStatusError
-    sys.modules.setdefault("proxyhub.errors", errors)
-
-    utils = types.ModuleType("proxyhub.utils")
-    utils.log = _log
-    utils.IPPattern = re.compile(r"(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)")
-    utils.IPPortPatternGlobal = re.compile(
-        r"(?P<ip>(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?))" \
-        r"(?=.*?(?:(?:(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?))|(?P<port>\d{2,5})))",
-        flags=re.DOTALL,
-    )
-    def get_headers(rv: bool = False):
-        _rv = str(random.randint(1000, 9999)) if rv else ""
-        headers = {
-            "User-Agent": f"PxBroker/0.0/{_rv}",
-            "Accept": "*/*",
-            "Accept-Encoding": "gzip, deflate",
-            "Pragma": "no-cache",
-            "Cache-control": "no-cache",
-            "Cookie": "cookie=ok",
-            "Referer": "https://www.google.com/",
-        }
-        return headers if not rv else (headers, _rv)
-    utils.get_headers = get_headers
-    sys.modules.setdefault("proxyhub.utils", utils)
-
-    spec = importlib.util.spec_from_file_location("proxyhub.providers", base_path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["proxyhub.providers"] = module
-    spec.loader.exec_module(module)  # type: ignore
-    _PROVIDER_MODULE = module
-    return module
-
-# ---------------------------------------------------------------------------
-# ProxyHub fallbacks
-# ---------------------------------------------------------------------------
-try:
-    from proxyhub import SOURCE_LIST, fetch_source  # type: ignore
-except Exception:  # pragma: no cover - missing dependency
-    SOURCE_LIST = []
-    async def fetch_source(url: str) -> List[str]:
-        return []
-    _log.warning("proxyhub module not found or incomplete, disabling ProxyHub scraping")
 
 # ---------------------------------------------------------------------------
 # Scoring configuration
@@ -398,8 +331,24 @@ class ProxySpider(Spider):
         self.save_proxies(protocol, proxies)
 
     def extract_proxies(self, html_content: str) -> List[str]:
-        pattern = re.compile(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+")
-        return pattern.findall(html_content)
+        patterns = [
+            r"(?:(?:http|https|socks[45])://)?(?P<ip>\d{1,3}(?:\.\d{1,3}){3}):(?P<port>\d+)(?:/)?",
+            r"(?:(?:http|https|socks[45])://)?\[(?P<ip>[A-F0-9:]+)\]:(?P<port>\d+)(?:/)?",
+            r"(?P<ip>\d{1,3}(?:\.\d{1,3}){3})[.;-](?P<port>\d+)",
+            r"\[(?P<ip>[A-F0-9:]+)\][.;-](?P<port>\d+)",
+            r"(?P<ip>\d{1,3}(?:\.\d{1,3}){3})\s+(?P<port>\d+)",
+            r"\[(?P<ip>[A-F0-9:]+)\]\s+(?P<port>\d+)",
+            r"(?:(?:http|https|socks[45])://)?(?P<ip>[A-F0-9]*:[A-F0-9:]+):(?P<port>\d+)",
+            r"(?P<ip>[A-F0-9]*:[A-F0-9:]+)[.;-](?P<port>\d+)",
+            r'"(?P<ip>\d{1,3}(?:\.\d{1,3}){3}):(?P<port>\d+)"',
+            r"(?:(?:http|https|socks[45])://)?(?P<ip>\d{1,3}(?:\.\d{1,3}){3}):(?P<port>\d+)/",
+        ]
+        found: List[str] = []
+        for pat in patterns:
+            for ip, port in re.findall(pat, html_content, flags=re.I):
+                found.append(f"{ip}:{port}")
+        # remove duplicates while preserving order
+        return list(dict.fromkeys(found))
 
     def save_proxies(self, protocol: str, proxies: List[str]) -> None:
         os.makedirs("output", exist_ok=True)
@@ -450,34 +399,18 @@ async def filter_p2(proxies: List[str]) -> tuple[List[tuple[str, int]], List[tup
     return accepted, quarantine
 
 # ---------------------------------------------------------------------------
-# Minimal async fetcher using ProxyHub providers
+# Minimal async fetcher using HTTP sources
 # ---------------------------------------------------------------------------
 async def fetch_proxies(types: List[str] | None = None, limit: int = 100) -> List[str]:
     if types is None:
         types = ["HTTP", "HTTPS"]
-    provider_mod = _load_provider_module()
-    providers = provider_mod.PROVIDERS
-    tasks = [p.get_proxies() for p in providers]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
     collected: List[str] = []
-    seen = set()
-    for provider, result in zip(providers, results):
-        if isinstance(result, Exception):  # pragma: no cover - network errors
-            _log.warning(
-                "provider %s failed: %s",
-                getattr(provider, "domain", provider.url),
-                result,
-            )
-            continue
-        for host, port, proto in result:
-            if proto and not set(proto) & set(types):
-                continue
-            proxy = f"{host}:{port}"
-            if proxy not in seen:
-                seen.add(proxy)
-                collected.append(proxy)
-                if len(collected) >= limit:
-                    return collected
+    proxies_by_type = await collect_proxies_by_type()
+    for proto in types:
+        for proxy in proxies_by_type.get(proto.upper(), []):
+            collected.append(proxy)
+            if len(collected) >= limit:
+                return collected
     return collected
 
 

@@ -1,5 +1,6 @@
 import asyncio
 import importlib
+import json
 
 
 class FakeResponse:
@@ -24,6 +25,14 @@ class FakeSession:
 
     async def get(self, url, timeout=10):
         return FakeResponse(self.text)
+
+
+class MapSession:
+    def __init__(self, mapping: dict[str, str]) -> None:
+        self.mapping = mapping
+
+    async def get(self, url, timeout=10):
+        return FakeResponse(self.mapping[url])
 
 
 def test_fetch_proxxy_sources(monkeypatch):
@@ -56,3 +65,25 @@ def test_proxyspider_extract():
     spider = sp.ProxySpider()
     html = "<p>1.2.3.4:80</p> other 5.6.7.8:1080"
     assert spider.extract_proxies(html) == ["1.2.3.4:80", "5.6.7.8:1080"]
+
+
+def test_collect_proxies_by_type(monkeypatch, tmp_path):
+    sp = importlib.import_module("scrape_proxies")
+    mapping = {
+        "http://h": "1.1.1.1:1\n",
+        "http://s5": "2.2.2.2:2\ninvalid",
+    }
+    monkeypatch.setattr(sp, "PROXXY_SOURCES", {"HTTP": ["http://h"], "SOCKS5": ["http://s5"]})
+
+    async def fake_session():
+        return MapSession(mapping)
+
+    monkeypatch.setattr(sp, "get_aiohttp_session", fake_session)
+
+    res = asyncio.run(sp.collect_proxies_by_type())
+    assert res == {"HTTP": ["1.1.1.1:1"], "SOCKS5": ["2.2.2.2:2"]}
+
+    out = tmp_path / "out.json"
+    asyncio.run(sp.save_proxies_json(str(out)))
+    saved = json.loads(out.read_text())
+    assert saved == res

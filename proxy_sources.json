@@ -1,19 +1,30 @@
 {
   "HTTP": [
     "https://example.com/http.txt",
-    "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/http.txt"
+    "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/http.txt",
+    "https://raw.githubusercontent.com/Skiddle-ID/proxylist/refs/heads/main/proxies.json",
+    "https://raw.githubusercontent.com/zebbern/Proxy-Scraper/refs/heads/main/http.txt",
+    "https://raw.githubusercontent.com/zebbern/Proxy-Scraper/refs/heads/main/proxydump.txt",
+    "https://raw.githubusercontent.com/lalifeier/proxy-scraper/main/proxies/http.txt"
   ],
   "HTTPS": [
     "https://example.com/https.txt",
-    "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/https.txt"
+    "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/https.txt",
+    "https://api.openproxylist.xyz/https.txt"
   ],
   "SOCKS4": [
     "https://example.com/socks4.txt",
-    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks4/data.txt"
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks4/data.txt",
+    "https://raw.githubusercontent.com/zebbern/Proxy-Scraper/refs/heads/main/socks4.txt",
+    "https://raw.githubusercontent.com/lalifeier/proxy-scraper/main/proxies/socks4.txt"
   ],
   "SOCKS5": [
     "https://example.com/socks5.txt",
     "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt",
-    "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/socks5.txt"
+    "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/socks5.txt",
+    "https://raw.githubusercontent.com/hookzof/socks5_list/master/tg/mtproto.json",
+    "https://raw.githubusercontent.com/hookzof/socks5_list/master/tg/socks.json",
+    "https://raw.githubusercontent.com/zebbern/Proxy-Scraper/refs/heads/main/socks5.txt",
+    "https://raw.githubusercontent.com/lalifeier/proxy-scraper/main/proxies/socks5.txt"
   ]
 }

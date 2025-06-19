@@ -47,7 +47,11 @@
     "https://raw.githubusercontent.com/proxifly/free-proxy-list/main/proxies/all/data.txt",
     "https://raw.githubusercontent.com/themiralay/Proxy-List-World/master/data.txt",
     "https://raw.githubusercontent.com/andigwandi/free-proxy/main/proxy_list.txt",
-    "https://raw.githubusercontent.com/arunsakthivel96/proxyBEE/refs/heads/master/proxy.list"
+    "https://raw.githubusercontent.com/arunsakthivel96/proxyBEE/refs/heads/master/proxy.list",
+    "https://raw.githubusercontent.com/Skiddle-ID/proxylist/refs/heads/main/proxies.json",
+    "https://raw.githubusercontent.com/zebbern/Proxy-Scraper/refs/heads/main/http.txt",
+    "https://raw.githubusercontent.com/zebbern/Proxy-Scraper/refs/heads/main/proxydump.txt",
+    "https://raw.githubusercontent.com/lalifeier/proxy-scraper/main/proxies/http.txt"
   ],
   "SOCKS4": [
     "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=socks4",
@@ -82,7 +86,9 @@
     "https://www.proxy-list.download/api/v1/get?type=socks4",
     "https://proxyspace.pro/socks4.txt",
     "https://raw.githubusercontent.com/HyperBeats/proxy-list/main/socks4.txt",
-    "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks4.txt"
+    "https://raw.githubusercontent.com/zloi-user/hideip.me/main/socks4.txt",
+    "https://raw.githubusercontent.com/zebbern/Proxy-Scraper/refs/heads/main/socks4.txt",
+    "https://raw.githubusercontent.com/lalifeier/proxy-scraper/main/proxies/socks4.txt"
   ],
   "SOCKS5": [
     "https://raw.githubusercontent.com/B4RC0DE-TM/proxy-list/main/SOCKS5.txt",
@@ -120,7 +126,11 @@
     "https://raw.githubusercontent.com/manuGMG/proxy-365/main/SOCKS5.txt",
     "https://raw.githubusercontent.com/casals-ar/proxy-list/main/socks5",
     "https://raw.githubusercontent.com/ALIILAPRO/Proxy/main/socks5.txt",
-    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks5.txt"
+    "https://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/master/socks5.txt",
+    "https://raw.githubusercontent.com/hookzof/socks5_list/master/tg/mtproto.json",
+    "https://raw.githubusercontent.com/hookzof/socks5_list/master/tg/socks.json",
+    "https://raw.githubusercontent.com/zebbern/Proxy-Scraper/refs/heads/main/socks5.txt",
+    "https://raw.githubusercontent.com/lalifeier/proxy-scraper/main/proxies/socks5.txt"
   ],
   "HTTPS": [
     "https://raw.githubusercontent.com/jetkai/proxy-list/main/online-proxies/txt/proxies-https.txt",
@@ -135,6 +145,9 @@
     "https://raw.githubusercontent.com/claude89757/free_https_proxies/refs/heads/main/https_proxies.txt",
     "https://raw.githubusercontent.com/mmpx12/proxy-list/master/https.txt",
     "https://raw.githubusercontent.com/roosterkid/openproxylist/main/HTTPS_RAW.txt",
-    "https://raw.githubusercontent.com/casals-ar/proxy-list/main/https"
+    "https://raw.githubusercontent.com/casals-ar/proxy-list/main/https",
+    "https://api.openproxylist.xyz/https.txt",
+    "https://raw.githubusercontent.com/zebbern/Proxy-Scraper/refs/heads/main/https.txt",
+    "https://raw.githubusercontent.com/lalifeier/proxy-scraper/main/proxies/https.txt"
   ]
 }

@@ -1,6 +1,19 @@
 {
-    "HTTP": ["https://example.com/http.txt"],
-    "HTTPS": ["https://example.com/https.txt"],
-    "SOCKS4": ["https://example.com/socks4.txt"],
-    "SOCKS5": ["https://example.com/socks5.txt"]
+  "HTTP": [
+    "https://example.com/http.txt",
+    "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/http.txt"
+  ],
+  "HTTPS": [
+    "https://example.com/https.txt",
+    "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/https.txt"
+  ],
+  "SOCKS4": [
+    "https://example.com/socks4.txt",
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks4/data.txt"
+  ],
+  "SOCKS5": [
+    "https://example.com/socks5.txt",
+    "https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/socks5/data.txt",
+    "https://cdn.jsdelivr.net/gh/databay-labs/free-proxy-list/socks5.txt"
+  ]
 }

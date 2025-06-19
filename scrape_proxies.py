@@ -16,6 +16,8 @@ from typing import List, AsyncGenerator, Any
 
 __all__ = [
     "fetch_proxies",
+    "probe_proxies",
+    "classify_proxy",
     "normalize_proxy",
     "_write_gzip",
     "bencode",
@@ -477,3 +479,148 @@ async def fetch_proxies(types: List[str] | None = None, limit: int = 100) -> Lis
                 if len(collected) >= limit:
                     return collected
     return collected
+
+
+EXAMPLE_IP = ipaddress.ip_address("93.184.216.34").packed
+SOCKS5_GREETING = b"\x05\x01\x00"
+SOCKS4_REQ = b"\x04\x01" + (80).to_bytes(2, "big") + EXAMPLE_IP + b"\x00"
+HTTP_GET_REQ = b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n"
+HTTPS_CONNECT_REQ = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+
+
+async def _open_connection(host: str, port: int, timeout: float) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    return await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
+
+
+async def _try_socks5(host: str, port: int, timeout: float) -> bool:
+    try:
+        reader, writer = await _open_connection(host, port, timeout)
+    except Exception:
+        return False
+    try:
+        writer.write(SOCKS5_GREETING)
+        await writer.drain()
+        data = await asyncio.wait_for(reader.readexactly(2), timeout)
+        return len(data) == 2 and data[0] == 0x05
+    except Exception:
+        return False
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def _try_socks4(host: str, port: int, timeout: float) -> bool:
+    try:
+        reader, writer = await _open_connection(host, port, timeout)
+    except Exception:
+        return False
+    try:
+        writer.write(SOCKS4_REQ)
+        await writer.drain()
+        data = await asyncio.wait_for(reader.readexactly(2), timeout)
+        return len(data) == 2 and data[0] == 0x00
+    except Exception:
+        return False
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def _try_http_get(host: str, port: int, timeout: float) -> bool:
+    try:
+        reader, writer = await _open_connection(host, port, timeout)
+    except Exception:
+        return False
+    try:
+        writer.write(HTTP_GET_REQ)
+        await writer.drain()
+        data = await asyncio.wait_for(reader.read(64), timeout)
+        return b"HTTP/1." in data
+    except Exception:
+        return False
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+async def _try_https_connect(host: str, port: int, timeout: float) -> bool:
+    try:
+        reader, writer = await _open_connection(host, port, timeout)
+    except Exception:
+        return False
+    try:
+        writer.write(HTTPS_CONNECT_REQ)
+        await writer.drain()
+        data = await asyncio.wait_for(reader.read(64), timeout)
+        if not data:
+            return False
+        status_line = data.split(b"\r\n", 1)[0]
+        return b"200" in status_line
+    except Exception:
+        return False
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
+def _split_host_port(proxy: str) -> tuple[str, int] | None:
+    proxy = proxy.split("://")[-1]
+    proxy = proxy.rsplit("@", 1)[-1]
+    if ":" not in proxy:
+        return None
+    host, port_str = proxy.rsplit(":", 1)
+    if not port_str.isdigit():
+        return None
+    return host, int(port_str)
+
+
+async def classify_proxy(proxy: str, timeout: float = 2.0) -> str | None:
+    parts = _split_host_port(proxy)
+    if not parts:
+        return None
+    host, port = parts
+    if await _try_socks5(host, port, timeout):
+        return "socks5"
+    if await _try_socks4(host, port, timeout):
+        return "socks4"
+    if await _try_http_get(host, port, timeout):
+        return "http"
+    if await _try_https_connect(host, port, timeout):
+        return "https"
+    return None
+
+
+async def probe_proxies(proxies: List[str], concurrency: int = 10000, timeout: float = 2.0) -> dict[str, int]:
+    sem = asyncio.Semaphore(concurrency)
+    counts = {"socks5": 0, "socks4": 0, "http": 0, "https": 0}
+
+    files = {
+        "socks5": open("socks5.txt", "a", buffering=1),
+        "socks4": open("socks4.txt", "a", buffering=1),
+        "http": open("http.txt", "a", buffering=1),
+        "https": open("https.txt", "a", buffering=1),
+    }
+
+    tested = 0
+
+    async def worker(p: str) -> None:
+        nonlocal tested
+        async with sem:
+            kind = await classify_proxy(p, timeout)
+            if kind:
+                files[kind].write(p + "\n")
+                files[kind].flush()
+                counts[kind] += 1
+        tested += 1
+        if tested % 10000 == 0:
+            print(
+                f"Tested {tested} proxies - socks5:{counts['socks5']} socks4:{counts['socks4']} http:{counts['http']} https:{counts['https']}"
+            )
+
+    tasks = [asyncio.create_task(worker(p)) for p in proxies]
+    await asyncio.gather(*tasks)
+
+    for fh in files.values():
+        fh.close()
+
+    return counts

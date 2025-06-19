@@ -23,6 +23,8 @@ __all__ = [
     "PROXXY_SOURCES",
     "get_aiohttp_session",
     "fetch_proxxy_sources",
+    "collect_proxies_by_type",
+    "save_proxies_json",
     "ProxySpider",
     "SOURCE_LIST",
     "fetch_source",
@@ -304,6 +306,30 @@ async def fetch_proxxy_sources() -> AsyncGenerator[List[str], None]:
             _log.error("proXXy source error %s: %s", url, e)
     if batch:
         yield batch
+
+
+async def collect_proxies_by_type() -> dict[str, List[str]]:
+    """Return proxies from all sources grouped by proxy type."""
+    result: dict[str, List[str]] = {k: [] for k in PROXXY_SOURCES}
+    session = await get_aiohttp_session()
+    for proto, urls in PROXXY_SOURCES.items():
+        for url in urls:
+            try:
+                resp = await session.get(url, timeout=REQUEST_TIMEOUT)
+                async for raw_line in resp.content:
+                    line = raw_line.decode(errors="ignore").strip()
+                    if IP_PORT_RE.match(line):
+                        result[proto].append(line)
+            except Exception as e:  # pragma: no cover - network failures
+                _log.error("proXXy source error %s: %s", url, e)
+    return result
+
+
+async def save_proxies_json(path: str) -> None:
+    """Write collected proxies to *path* in JSON format."""
+    data = await collect_proxies_by_type()
+    with open(path, "w") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
 
 try:
     from scrapy import Spider, Request  # type: ignore

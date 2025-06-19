@@ -279,7 +279,6 @@ IP_PORT_RE = re.compile(
 )
 REQUEST_TIMEOUT = 10
 
-aiohttp_session: Any | None = None
 
 
 def extract_proxies_from_text(text: str) -> List[str]:
@@ -320,65 +319,74 @@ def extract_proxies_from_text(text: str) -> List[str]:
 
     return proxies
 
-async def get_aiohttp_session() -> Any:
-    global aiohttp_session
-    if aiohttp_session is None:
-        try:
-            import aiohttp  # type: ignore
-        except Exception as exc:  # pragma: no cover - optional dependency
-            raise RuntimeError("aiohttp required") from exc
-        aiohttp_session = aiohttp.ClientSession()
-    return aiohttp_session
+from contextlib import asynccontextmanager
+
+
+@asynccontextmanager
+async def get_aiohttp_session() -> AsyncGenerator[Any, None]:
+    """Yield a temporary ``aiohttp.ClientSession`` and close it afterwards."""
+    try:
+        import aiohttp  # type: ignore
+    except Exception as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("aiohttp required") from exc
+    session = aiohttp.ClientSession()
+    try:
+        yield session
+    finally:
+        await session.close()
 
 async def fetch_proxxy_sources() -> AsyncGenerator[List[str], None]:
     sources = PROXXY_SOURCES
     urls = [u for lst in sources.values() for u in lst]
-    session = await get_aiohttp_session()
-    tasks = {asyncio.create_task(session.get(url, timeout=REQUEST_TIMEOUT)): url for url in urls}
-    batch: List[str] = []
-    seen: set[str] = set()
-    for task in asyncio.as_completed(tasks):
-        url = tasks[task]
-        try:
-            resp = await task
-            text_parts: List[str] = []
-            async for raw_line in resp.content:
-                text_parts.append(raw_line.decode(errors="ignore"))
-            proxies = extract_proxies_from_text("\n".join(text_parts))
-            for p in proxies:
-                if p in seen:
-                    continue
-                seen.add(p)
-                batch.append(p)
-                if len(batch) >= 1000:
-                    yield batch
-                    batch = []
-        except Exception as e:  # pragma: no cover - network failures
-            _log.error("proXXy source error %s: %s", url, e)
-    if batch:
-        yield batch
+    async with get_aiohttp_session() as session:
+        tasks = {
+            asyncio.create_task(session.get(url, timeout=REQUEST_TIMEOUT)): url
+            for url in urls
+        }
+        batch: List[str] = []
+        seen: set[str] = set()
+        for task in asyncio.as_completed(tasks):
+            url = tasks[task]
+            try:
+                resp = await task
+                text_parts: List[str] = []
+                async for raw_line in resp.content:
+                    text_parts.append(raw_line.decode(errors="ignore"))
+                proxies = extract_proxies_from_text("\n".join(text_parts))
+                for p in proxies:
+                    if p in seen:
+                        continue
+                    seen.add(p)
+                    batch.append(p)
+                    if len(batch) >= 1000:
+                        yield batch
+                        batch = []
+            except Exception as e:  # pragma: no cover - network failures
+                _log.error("proXXy source error %s: %s", url, e)
+        if batch:
+            yield batch
 
 
 async def collect_proxies_by_type() -> dict[str, List[str]]:
     """Return proxies from all sources grouped by proxy type."""
     result: dict[str, List[str]] = {k: [] for k in PROXXY_SOURCES}
     seen: dict[str, set[str]] = {k: set() for k in PROXXY_SOURCES}
-    session = await get_aiohttp_session()
-    for proto, urls in PROXXY_SOURCES.items():
-        for url in urls:
-            try:
-                resp = await session.get(url, timeout=REQUEST_TIMEOUT)
-                text_parts: List[str] = []
-                async for raw_line in resp.content:
-                    text_parts.append(raw_line.decode(errors="ignore"))
-                proxies = extract_proxies_from_text("\n".join(text_parts))
-                for p in proxies:
-                    if p in seen[proto]:
-                        continue
-                    seen[proto].add(p)
-                    result[proto].append(p)
-            except Exception as e:  # pragma: no cover - network failures
-                _log.error("proXXy source error %s: %s", url, e)
+    async with get_aiohttp_session() as session:
+        for proto, urls in PROXXY_SOURCES.items():
+            for url in urls:
+                try:
+                    resp = await session.get(url, timeout=REQUEST_TIMEOUT)
+                    text_parts: List[str] = []
+                    async for raw_line in resp.content:
+                        text_parts.append(raw_line.decode(errors="ignore"))
+                    proxies = extract_proxies_from_text("\n".join(text_parts))
+                    for p in proxies:
+                        if p in seen[proto]:
+                            continue
+                        seen[proto].add(p)
+                        result[proto].append(p)
+                except Exception as e:  # pragma: no cover - network failures
+                    _log.error("proXXy source error %s: %s", url, e)
     return result
 
 

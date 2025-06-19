@@ -274,10 +274,7 @@ def load_proxy_sources(path: str = PROXY_SOURCES_PATH) -> dict[str, list[str]]:
 
 PROXXY_SOURCES = load_proxy_sources()
 
-IP_PORT_RE = re.compile(
-    r"^(?:\w+://)?(?P<ip>\[?[0-9A-Fa-f:.]+\]?)(?::(?P<port>\d{1,5})).*",
-    re.I,
-)
+IP_PORT_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$")
 REQUEST_TIMEOUT = 10
 
 aiohttp_session: Any | None = None
@@ -304,15 +301,8 @@ async def fetch_proxxy_sources() -> AsyncGenerator[List[str], None]:
             resp = await task
             async for raw_line in resp.content:
                 line = raw_line.decode(errors="ignore").strip()
-                m = IP_PORT_RE.match(line)
-                if m:
-                    ip = m.group('ip').strip('[]')
-                    port = m.group('port')
-                    try:
-                        ipaddress.ip_address(ip)
-                    except ValueError:
-                        continue
-                    batch.append(f"{ip}:{port}")
+                if IP_PORT_RE.match(line):
+                    batch.append(line)
                     if len(batch) >= 1000:
                         yield batch
                         batch = []
@@ -332,15 +322,8 @@ async def collect_proxies_by_type() -> dict[str, List[str]]:
                 resp = await session.get(url, timeout=REQUEST_TIMEOUT)
                 async for raw_line in resp.content:
                     line = raw_line.decode(errors="ignore").strip()
-                    m = IP_PORT_RE.match(line)
-                    if m:
-                        ip = m.group('ip').strip('[]')
-                        port = m.group('port')
-                        try:
-                            ipaddress.ip_address(ip)
-                        except ValueError:
-                            continue
-                        result[proto].append(f"{ip}:{port}")
+                    if IP_PORT_RE.match(line):
+                        result[proto].append(line)
             except Exception as e:  # pragma: no cover - network failures
                 _log.error("proXXy source error %s: %s", url, e)
     return result
@@ -417,25 +400,88 @@ class ProxySpider(Spider):
 # Scoring helpers used by filter1
 # ---------------------------------------------------------------------------
 
-async def load_blacklists() -> None:
-    return None
+# Keep in-memory blacklist loaded from optional file
+BLACKLIST: set[str] = set()
 
 
-async def _score_single_proxy(p: str, ctx: ssl.SSLContext, return_all: bool = False):
-    return None
+async def load_blacklists(path: str | None = None) -> None:
+    """Load blacklist entries from *path* into ``BLACKLIST`` if available."""
+
+    global BLACKLIST
+    BLACKLIST.clear()
+    file_path = path or os.getenv(
+        "BLACKLIST_PATH",
+        str(Path(__file__).resolve().parent / "data" / "blacklist.txt"),
+    )
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        BLACKLIST.add(line)
+        except Exception as exc:  # pragma: no cover - optional file errors
+            _log.error("error loading blacklist %s: %s", file_path, exc)
 
 
-async def filter1(proxies: List[str], timeout: float = 5.0, concurrency: int = 5000) -> List[str]:
-    """Return list of proxies that pass the TLS reachability check."""
+async def _score_single_proxy(
+    p: str, ctx: ssl.SSLContext, timeout: float, return_all: bool = False
+) -> tuple[str, int, dict[str, int]] | None:
+    """Return proxy score and component parts.
+
+    This simplified scorer only checks blacklist membership and TLS reachability.
+    ``ip_rep`` is treated as a constant weight for all proxies.
+    """
+
+    proto, host, port_str = p.split(":", 2)
+    parts: dict[str, int] = {}
+
+    if host in BLACKLIST:
+        parts["critical"] = 0
+        return (p, 0, parts) if return_all else None
+
+    tls_ok = await check_tls(f"{host}:{port_str}", proto, timeout)
+    critical = WEIGHTS.get("tls_reach", 0) if tls_ok else 0
+    parts["critical"] = critical
+
+    score = critical + WEIGHTS.get("ip_rep", 0)
+
+    return (p, score, parts) if return_all else (p, score, parts)
+
+
+async def filter1(
+    proxies: List[str], timeout: float = 5.0, concurrency: int = 5000
+) -> List[str]:
+    """Filter *proxies* using TLS reachability and scoring thresholds."""
+
+    proxies = [
+        p
+        for p in proxies
+        if p.split(":", 1)[0].lower() in {"http", "https", "socks4", "socks5"}
+    ]
+    if not proxies:
+        return []
+
+    await load_blacklists()
+
+    ctx = ssl.create_default_context()
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
     sem = asyncio.Semaphore(concurrency)
     good: List[str] = []
 
     async def worker(p: str) -> None:
-        proto, host, port = p.split(":", 2)
         async with sem:
-            if await check_tls(f"{host}:{port}", proto, timeout):
-                good.append(p)
+            res = await _score_single_proxy(p, ctx, timeout, return_all=True)
+        if res is None:
+            return
+        norm, score, parts = res
+        crit = parts.get("critical", 0)
+        if score >= OVERALL_MIN and crit >= CRITICAL_MIN:
+            good.append(norm)
+        elif MODE == "lenient" and 500 <= score < 600:
+            # Quarantine feature from former filter_p2 (not returned)
+            pass
 
     tasks = [asyncio.create_task(worker(p)) for p in proxies]
     for t in asyncio.as_completed(tasks):

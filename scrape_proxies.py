@@ -274,7 +274,9 @@ def load_proxy_sources(path: str = PROXY_SOURCES_PATH) -> dict[str, list[str]]:
 
 PROXXY_SOURCES = load_proxy_sources()
 
-IP_PORT_RE = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}:\d+$")
+IP_PORT_RE = re.compile(
+    r"(?:\[(?P<ip6>[A-Fa-f0-9:]+)\]|(?P<ip4>(?:\d{1,3}\.){3}\d{1,3})):(?P<port>\d{1,5})"
+)
 REQUEST_TIMEOUT = 10
 
 aiohttp_session: Any | None = None
@@ -301,11 +303,15 @@ async def fetch_proxxy_sources() -> AsyncGenerator[List[str], None]:
             resp = await task
             async for raw_line in resp.content:
                 line = raw_line.decode(errors="ignore").strip()
-                if IP_PORT_RE.match(line):
-                    batch.append(line)
-                    if len(batch) >= 1000:
-                        yield batch
-                        batch = []
+                m = IP_PORT_RE.search(line)
+                if not m:
+                    continue
+                host = m.group("ip6") or m.group("ip4")
+                port = m.group("port")
+                batch.append(f"{host}:{port}")
+                if len(batch) >= 1000:
+                    yield batch
+                    batch = []
         except Exception as e:  # pragma: no cover - network failures
             _log.error("proXXy source error %s: %s", url, e)
     if batch:
@@ -322,8 +328,12 @@ async def collect_proxies_by_type() -> dict[str, List[str]]:
                 resp = await session.get(url, timeout=REQUEST_TIMEOUT)
                 async for raw_line in resp.content:
                     line = raw_line.decode(errors="ignore").strip()
-                    if IP_PORT_RE.match(line):
-                        result[proto].append(line)
+                    m = IP_PORT_RE.search(line)
+                    if not m:
+                        continue
+                    host = m.group("ip6") or m.group("ip4")
+                    port = m.group("port")
+                    result[proto].append(f"{host}:{port}")
             except Exception as e:  # pragma: no cover - network failures
                 _log.error("proXXy source error %s: %s", url, e)
     return result

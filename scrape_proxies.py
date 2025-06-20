@@ -41,10 +41,26 @@ __all__ = [
     "check_tls",
     "write_files",
     "print_stats",
+    "install_asyncio_exception_handler",
     "main",
 ]
 
 _log = logging.getLogger(__name__)
+
+
+def install_asyncio_exception_handler(loop: asyncio.AbstractEventLoop | None = None) -> None:
+    """Ignore ConnectionResetError from closed sockets on Windows."""
+    if loop is None:
+        loop = asyncio.get_event_loop()
+
+    def handle(loop: asyncio.AbstractEventLoop, context: Dict[str, Any]) -> None:
+        exc = context.get("exception")
+        if isinstance(exc, ConnectionResetError):
+            _log.debug("ignored ConnectionResetError: %s", exc)
+            return
+        loop.default_exception_handler(context)
+
+    loop.set_exception_handler(handle)
 
 
 
@@ -843,6 +859,8 @@ async def main(argv: List[str] | None = None) -> None:
     parser.add_argument("--stats-interval", type=float, default=1.0, help="Seconds between stats output")
     parser.add_argument("--output-dir", type=str, default=".", help="Directory for output files")
     args = parser.parse_args(argv)
+
+    install_asyncio_exception_handler()
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

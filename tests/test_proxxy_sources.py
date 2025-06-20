@@ -39,9 +39,14 @@ def test_fetch_proxxy_sources(monkeypatch):
     sp = importlib.import_module("scrape_proxies")
     monkeypatch.setattr(sp, "PROXXY_SOURCES", {"HTTP": ["http://example.com"]})
 
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
     async def fake_session():
-        text = "http://1.1.1.1:1\ninvalid\n2.2.2.2:2 extra\n[2001:db8::1]:8080"
-        return FakeSession(text)
+        text = (
+            "http://1.1.1.1:1\ninvalid\n2.2.2.2:2 extra\n[2001:db8::1]:8080"
+        )
+        yield FakeSession(text)
 
     monkeypatch.setattr(sp, "get_aiohttp_session", fake_session)
 
@@ -76,8 +81,11 @@ def test_collect_proxies_by_type(monkeypatch, tmp_path):
     }
     monkeypatch.setattr(sp, "PROXXY_SOURCES", {"HTTP": ["http://h"], "SOCKS5": ["http://s5"]})
 
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
     async def fake_session():
-        return MapSession(mapping)
+        yield MapSession(mapping)
 
     monkeypatch.setattr(sp, "get_aiohttp_session", fake_session)
 
@@ -98,8 +106,11 @@ def test_dedup_across_sources(monkeypatch):
     }
     monkeypatch.setattr(sp, "PROXXY_SOURCES", {"HTTP": ["http://a", "http://b"]})
 
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
     async def fake_session():
-        return MapSession(mapping)
+        yield MapSession(mapping)
 
     monkeypatch.setattr(sp, "get_aiohttp_session", fake_session)
 

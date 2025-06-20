@@ -49,14 +49,14 @@ _log = logging.getLogger(__name__)
 
 
 def install_asyncio_exception_handler(loop: asyncio.AbstractEventLoop | None = None) -> None:
-    """Ignore ConnectionResetError from closed sockets on Windows."""
+    """Ignore benign connection errors from closed sockets on Windows."""
     if loop is None:
         loop = asyncio.get_event_loop()
 
     def handle(loop: asyncio.AbstractEventLoop, context: Dict[str, Any]) -> None:
         exc = context.get("exception")
-        if isinstance(exc, ConnectionResetError):
-            _log.debug("ignored ConnectionResetError: %s", exc)
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError)):
+            _log.debug("ignored %s: %s", exc.__class__.__name__, exc)
             return
         loop.default_exception_handler(context)
 
@@ -592,6 +592,16 @@ async def _open_connection(host: str, port: int, timeout: float) -> tuple[asynci
     return await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
 
 
+async def _safe_close(writer: asyncio.StreamWriter) -> None:
+    writer.close()
+    try:
+        await writer.wait_closed()
+    except ConnectionError:
+        pass
+    except Exception as exc:  # pragma: no cover - unexpected close issue
+        _log.debug("ignored close error: %s", exc)
+
+
 async def _try_socks5(host: str, port: int, timeout: float) -> bool:
     try:
         reader, writer = await _open_connection(host, port, timeout)
@@ -605,8 +615,7 @@ async def _try_socks5(host: str, port: int, timeout: float) -> bool:
     except Exception:
         return False
     finally:
-        writer.close()
-        await writer.wait_closed()
+        await _safe_close(writer)
 
 
 async def _try_socks4(host: str, port: int, timeout: float) -> bool:
@@ -622,8 +631,7 @@ async def _try_socks4(host: str, port: int, timeout: float) -> bool:
     except Exception:
         return False
     finally:
-        writer.close()
-        await writer.wait_closed()
+        await _safe_close(writer)
 
 
 async def _try_http_get(host: str, port: int, timeout: float) -> bool:
@@ -639,8 +647,7 @@ async def _try_http_get(host: str, port: int, timeout: float) -> bool:
     except Exception:
         return False
     finally:
-        writer.close()
-        await writer.wait_closed()
+        await _safe_close(writer)
 
 
 async def _try_https_connect(host: str, port: int, timeout: float) -> bool:
@@ -659,8 +666,7 @@ async def _try_https_connect(host: str, port: int, timeout: float) -> bool:
     except Exception:
         return False
     finally:
-        writer.close()
-        await writer.wait_closed()
+        await _safe_close(writer)
 
 
 def _split_host_port(proxy: str) -> tuple[str, int] | None:

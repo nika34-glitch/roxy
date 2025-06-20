@@ -921,8 +921,16 @@ async def main(argv: List[str] | None = None) -> None:
             await print_stats(stats, out_dir)
         await print_stats(stats, out_dir)
 
-    await asyncio.gather(asyncio.create_task(stats_loop()), *workers)
-
-    write_files(files)
-    write_files(working_files)
+    stats_task = asyncio.create_task(stats_loop())
+    try:
+        await asyncio.gather(stats_task, *workers)
+    except asyncio.CancelledError:
+        for w in workers:
+            w.cancel()
+        stats_task.cancel()
+        await asyncio.gather(stats_task, *workers, return_exceptions=True)
+        raise
+    finally:
+        write_files(files)
+        write_files(working_files)
 
